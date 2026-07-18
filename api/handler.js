@@ -3,12 +3,15 @@ const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
+// 免费且功能强大的 Cobalt 官方高可用节点
+const COBALT_API = "https://api.cobalt.tools";
+
 function escapeHTML(str) {
   if (!str) return '';
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function quickFetch(url, options = {}, timeoutMs = 3500) {
+async function quickFetch(url, options = {}, timeoutMs = 4500) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -21,35 +24,17 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
   }
 }
 
-// 智能解析视频的画质分数与标签
-function parseVideoVariant(v, idx) {
-  let score = 0; // 清晰度分数（以长边像素为准）
-  let label = '';
-  
-  if (v.height && v.width) {
-    score = Math.max(v.width, v.height);
-    label = `${score}p`;
-  } else {
-    const match = v.url.match(/(\d+)x(\d+)/);
-    if (match) {
-      score = Math.max(parseInt(match[1]), parseInt(match[2]));
-      label = `${score}p`;
-    } else {
-      score = 0; 
-      label = `预设画质 ${idx + 1}`;
-    }
-  }
-  return { url: v.url, score, label };
-}
-
-// 核心业务：发送特定分辨率的视频流
-async function sendSpecificVideo(chatId, tweet, variant, size, caption) {
+// 核心业务：向 TG 发送选定档位的视频
+async function sendSpecificVideo(chatId, originalText, variant, size, twitterUrl) {
   const MAX_URL_SIZE = 20 * 1024 * 1024;
   const MAX_BOT_SIZE = 50 * 1024 * 1024;
-  const tweetId = tweet.id;
   
+  // 提取推文 ID 方便生成面板指引
+  const tweetId = twitterUrl.match(/status\/(\d+)/)?.[1] || "tweet";
+  
+  const caption = `📝 ${escapeHTML(originalText)}\n\n🔗 <a href="${twitterUrl}">查看原推特</a>\n⚙️ <i>当前投递画质: ${variant.label}</i>`;
   const replyMarkup = {
-    inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]]
+    inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${Buffer.from(twitterUrl).toString('base64url')}` }]]
   };
 
   if (size > 0 && size <= MAX_URL_SIZE) {
@@ -76,12 +61,8 @@ async function sendSpecificVideo(chatId, tweet, variant, size, caption) {
     formData.append('video', videoBlob, 'video.mp4');
     await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
   } else {
-    // 超限则下发带按钮的文本直链
     const sizeInMB = size > 0 ? (size / (1024 * 1024)).toFixed(1) : '未知';
-    const authorLink = `https://x.com/${tweet.author.screen_name}`;
-    const originalTweetLink = `https://x.com/i/status/${tweetId}`;
-    
-    const overSizeCaption = `📝 ${escapeHTML(tweet.text)}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n\n⚠️ 提示：该画质过大 (${sizeInMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此下载该高清原片</a> | <a href="${originalTweetLink}">查看原推特</a>`;
+    const overSizeCaption = `📝 ${escapeHTML(originalText)}\n\n⚠️ 提示：该画质过大 (${sizeInMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此下载该高清原片</a> | <a href="${twitterUrl}">查看原推特</a>`;
     
     await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
@@ -104,124 +85,111 @@ export default async function handler(req, res) {
     const chatId = callback.message.chat.id;
     const callbackData = callback.data;
 
-    // 告诉 TG 客户端收到点击，解除转圈状态
     await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ callback_query_id: callback.id })
     }).catch(() => {});
 
-    // 触发事件 1：请求画质列表清单
+    // 用户点击：展开完整的画质和体积面板
     if (callbackData.startsWith('list_q:')) {
-      const tweetId = callbackData.split(':')[1];
+      const encodedUrl = callbackData.split(':')[1];
+      const twitterUrl = Buffer.from(encodedUrl, 'base64url').toString();
       
       const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在多路同步探测各档位文件体积..." })
+        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在多路同步探测 Cobalt 节点的各档位文件体积..." })
       });
-      const progressData = await progressRes.json();
-      const progressMsgId = progressData.result?.message_id;
+      const progressMsgId = (await progressRes.json()).result?.message_id;
 
       try {
-        const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`);
-        const tweet = fxRes.ok ? (await fxRes.json()).tweet : null;
-        if (!tweet || !tweet.media?.videos) {
-          if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: "❌ 未能获取到有效的视频流资料。" }) });
-          return res.status(200).send('OK');
-        }
-
-        let rawVariants = tweet.media.videos;
-        if (tweet.media.all_videos && Array.isArray(tweet.media.all_videos)) {
-          rawVariants = rawVariants.concat(tweet.media.all_videos);
-        }
-
-        // 去重并解析所有变体
-        const uniqueUrls = new Set();
-        let sortedVariants = [];
-        rawVariants.forEach((v, idx) => {
-          if (!uniqueUrls.has(v.url)) {
-            uniqueUrls.add(v.url);
-            sortedVariants.push(parseVideoVariant(v, idx));
-          }
+        // 核心：让 Cobalt 解析出所有的各种质量包 (Tunnel / Picker 模式)
+        const cobRes = await fetch(COBALT_API, {
+          method: 'POST',
+          headers: { ...JSON_HEADERS, 'Accept': 'application/json' },
+          body: JSON.stringify({ url: twitterUrl, videoQuality: 'max', filenamePattern: 'basic' })
         });
-        sortedVariants.sort((a, b) => b.score - a.score);
+        const cobData = await cobRes.json();
 
-        // 并发探测体积
-        const sizePromises = sortedVariants.map(async (v) => {
+        // 兼容 Cobalt 多流返回机制（通常大视频会给一组 picker 列表或不同流）
+        let variants = [];
+        if (cobData.picker && Array.isArray(cobData.picker)) {
+          variants = cobData.picker.map((p, i) => ({ url: p.url, score: 2000 - i * 200, label: p.type || `${1080 - i * 240}p` }));
+        } else if (cobData.url) {
+          variants = [{ url: cobData.url, score: 1080, label: '🔥 默认最高清' }];
+        }
+
+        if (variants.length === 0) {
+          throw new Error("Cobalt 网关未响应多流清单");
+        }
+
+        // 并发探测各分辨率大小
+        const sizes = await Promise.all(variants.map(async (v) => {
           try {
-            const hRes = await quickFetch(v.url, { method: 'HEAD' }, 2000);
+            const hRes = await quickFetch(v.url, { method: 'HEAD' }, 1800);
             return parseInt(hRes.headers.get('content-length') || '0', 10);
           } catch { return 0; }
-        });
-        const sizes = await Promise.all(sizePromises);
+        }));
 
-        // 组装内联键盘选项
         const keyboard = [];
-        sortedVariants.forEach((v, idx) => {
+        variants.forEach((v, idx) => {
           const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
           keyboard.push([{
             text: `${v.label} - ${sizeMB}`,
-            callback_data: `send_q:${tweetId}:${idx}`
+            callback_data: `send_q:${encodedUrl}:${idx}`
           }]);
         });
 
-        // 修改进度消息为清单面板
         await fetch(`${TELEGRAM_API}/editMessageText`, {
           method: 'POST',
           headers: JSON_HEADERS,
           body: JSON.stringify({
             chat_id: chatId,
             message_id: progressMsgId,
-            text: `📊 <b>推文 [${tweetId}] 完整画质清单</b>\n下方每一档皆可点击，体积符合将会直接发送文件，超限则发送无损直链。`,
+            text: `📊 <b>当前推文多画质清单 (来自 Cobalt 深度解包)</b>\n点击下方按钮，会自动将对应文件直接转存至你的窗口中。`,
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: keyboard }
           })
         });
 
       } catch (err) {
-        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 探测发生异常: ${err.message}` }) });
+        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 探测发生异常或该视频无多变体: ${err.message}` }) });
       }
     }
 
-    // 触发事件 2：点击了清单中的某一档，执行精准发送
+    // 用户点击：指定了具体的某一个画质档位进行发送
     if (callbackData.startsWith('send_q:')) {
-      const [, tweetId, indexStr] = callbackData.split(':');
+      const [, encodedUrl, indexStr] = callbackData.split(':');
+      const twitterUrl = Buffer.from(encodedUrl, 'base64url').toString();
       const targetIdx = parseInt(indexStr, 10);
 
       try {
-        const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`);
-        const tweet = fxRes.ok ? (await fxRes.json()).tweet : null;
-        if (!tweet) return res.status(200).send('OK');
-
-        let rawVariants = tweet.media.videos || [];
-        if (tweet.media.all_videos && Array.isArray(tweet.media.all_videos)) {
-          rawVariants = rawVariants.concat(tweet.media.all_videos);
+        const cobRes = await fetch(COBALT_API, {
+          method: 'POST',
+          headers: { ...JSON_HEADERS, 'Accept': 'application/json' },
+          body: JSON.stringify({ url: twitterUrl, videoQuality: 'max' })
+        });
+        const cobData = await cobRes.json();
+        
+        let variants = [];
+        if (cobData.picker && Array.isArray(cobData.picker)) {
+          variants = cobData.picker.map((p, i) => ({ url: p.url, score: 2000 - i * 200, label: p.type || `${1080 - i * 240}p` }));
+        } else if (cobData.url) {
+          variants = [{ url: cobData.url, score: 1080, label: '🔥 默认最高清' }];
         }
 
-        const uniqueUrls = new Set();
-        let sortedVariants = [];
-        rawVariants.forEach((v, idx) => {
-          if (!uniqueUrls.has(v.url)) {
-            uniqueUrls.add(v.url);
-            sortedVariants.push(parseVideoVariant(v, idx));
-          }
-        });
-        sortedVariants.sort((a, b) => b.score - a.score);
+        const chosen = variants[targetIdx];
+        if (!chosen) return res.status(200).send('OK');
 
-        const chosenVariant = sortedVariants[targetIdx];
-        if (!chosenVariant) return res.status(200).send('OK');
-
-        const hRes = await quickFetch(chosenVariant.url, { method: 'HEAD' }, 2000);
+        const hRes = await quickFetch(chosen.url, { method: 'HEAD' }, 2000);
         const size = parseInt(hRes.headers.get('content-length') || '0', 10);
 
-        const authorLink = `https://x.com/${tweet.author.screen_name}`;
-        const originalTweetLink = `https://x.com/i/status/${tweetId}`;
-        const caption = `📝 ${escapeHTML(tweet.text)}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n🔗 <a href="${originalTweetLink}">查看原推特</a>\n⚙️ <i>手动指定投递画质: ${chosenVariant.label}</i>`;
-
-        await sendSpecificVideo(chatId, tweet, chosenVariant, size, caption);
+        // 使用通用文本，因为 Cobalt 主打提取视频，不一定会完全格式化复杂的推特文本
+        const originalText = callback.message.text || "X 视频转存";
+        await sendSpecificVideo(chatId, originalText, chosen, size, twitterUrl);
       } catch (e) {
-        console.error('手动投递失败', e.message);
+        console.error('手动指定发送失败', e.message);
       }
     }
 
@@ -240,126 +208,91 @@ export default async function handler(req, res) {
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
 
-  // 强行同步删除用户发送的原消息
+  // 1. 无条件秒删原消息
   try {
     await fetch(`${TELEGRAM_API}/deleteMessage`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ chat_id: chatId, message_id: messageId })
     });
-  } catch (e) {
-    console.error('删除消息权限不足:', e.message);
-  }
+  } catch (e) {}
 
   const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
   const match = text.match(twitterRegex);
   if (!match) return res.status(200).send('OK'); 
 
-  const tweetId = match[1];
-  const fxApiUrl = `https://api.fxtwitter.com/i/status/${tweetId}`;
+  // 获取标准的推特原始链接传送给 Cobalt 提取
+  const originalTwitterUrl = match[0].startsWith('http') ? match[0] : `https://${match[0]}`;
 
   try {
-    const fxRes = await quickFetch(fxApiUrl);
-    if (!fxRes.ok) throw new Error('解析接口无响应');
-    
-    const fxData = await fxRes.json();
-    const tweet = fxData.tweet;
-    if (!tweet) return res.status(200).send('OK');
+    // 2. 携带参数请求 Cobalt 解包核心
+    const cobRes = await fetch(COBALT_API, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, 'Accept': 'application/json' },
+      body: JSON.stringify({
+        url: originalTwitterUrl,
+        videoQuality: 'max', // 默认让它先探测最高质量
+        filenamePattern: 'basic'
+      })
+    });
 
-    const safeText = escapeHTML(tweet.text);
-    const authorLink = `https://x.com/${tweet.author.screen_name}`;
-    const originalTweetLink = `https://x.com/i/status/${tweetId}`;
-    let caption = `📝 ${safeText}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n🔗 <a href="${originalTweetLink}">查看原推特</a>`;
+    if (!cobRes.ok) throw new Error("Cobalt 节点无响应");
+    const cobData = await cobRes.json();
 
-    const media = tweet.media || {};
-    let rawVariants = media.videos || [];
-    if (media.all_videos && Array.isArray(media.all_videos)) {
-      rawVariants = rawVariants.concat(media.all_videos);
+    // 如果返回的是流媒体列表文件 (picker 阵列)
+    let sortedVariants = [];
+    if (cobData.picker && Array.isArray(cobData.picker)) {
+      sortedVariants = cobData.picker.map((p, i) => ({
+        url: p.url,
+        score: p.type && p.type.includes('p') ? parseInt(p.type) : (1440 - i * 360),
+        label: p.type || `${1080 - i * 240}p`
+      }));
+    } else if (cobData.url) {
+      // 只有单档流
+      sortedVariants = [{ url: cobData.url, score: 1080, label: '原画高清' }];
     }
-    const photos = media.photos || [];
 
-    // --- 核心业务：自动级联逐级降级逻辑 ---
-    if (rawVariants.length > 0) {
-      const uniqueUrls = new Set();
-      let sortedVariants = [];
-      rawVariants.forEach((v, idx) => {
-        if (!uniqueUrls.has(v.url)) {
-          uniqueUrls.add(v.url);
-          sortedVariants.push(parseVideoVariant(v, idx));
-        }
-      });
-      // 按清晰度从高到低强制排序
-      sortedVariants.sort((a, b) => b.score - a.score);
+    // 强制从最高画质往低排序
+    sortedVariants.sort((a, b) => b.score - a.score);
 
-      let finalSelectedVariant = null;
-      let finalSize = 0;
-      const MAX_BOT_SIZE = 50 * 1024 * 1024; // 50MB
+    let finalSelectedVariant = null;
+    let finalSize = 0;
+    const MAX_BOT_SIZE = 50 * 1024 * 1024;
 
-      // 从最高画质开始逐级往下滚动尝试
-      for (const variant of sortedVariants) {
-        // 如果遇到了低于最低标准 1080p 的档位，直接触发熔断机制，中断尝试
-        if (variant.score > 0 && variant.score < 1080) {
-          break;
-        }
-
-        try {
-          const hRes = await quickFetch(variant.url, { method: 'HEAD' }, 1500);
-          const size = parseInt(hRes.headers.get('content-length') || '0', 10);
-          
-          if (size > 0 && size <= MAX_BOT_SIZE) {
-            finalSelectedVariant = variant;
-            finalSize = size;
-            break; // 完美匹配成功，退出查找
-          }
-        } catch (e) {
-          console.warn('级联探测单路跳过');
-        }
+    // --- 核心级联算法：从最高分辨率往下检查，1080p 熔断 ---
+    for (const variant of sortedVariants) {
+      if (variant.score > 0 && variant.score < 1080) {
+        break; // 低于 1080p 触发熔断，不再继续向下妥协
       }
+      try {
+        const hRes = await quickFetch(variant.url, { method: 'HEAD' }, 1500);
+        const size = parseInt(hRes.headers.get('content-length') || '0', 10);
+        if (size > 0 && size <= MAX_BOT_SIZE) {
+          finalSelectedVariant = variant;
+          finalSize = size;
+          break; // 抓到一个完美符合 $\le 50\text{MB}$ 且清晰度合格的档位，收工！
+        }
+      } catch (e) {}
+    }
 
-      if (finalSelectedVariant) {
-        // 自动降级成功流
-        caption += `\n💡 <i>画质已智能适配调整至: ${finalSelectedVariant.label}</i>`;
-        await sendSpecificVideo(chatId, tweet, finalSelectedVariant, finalSize, caption);
-      } else {
-        // 满足 1080p 底线的所有画质均超过 50MB，下发最高画质的外部直链逻辑
-        const topVariant = sortedVariants[0];
-        try {
-          const hRes = await quickFetch(topVariant.url, { method: 'HEAD' }, 1500);
-          finalSize = parseInt(hRes.headers.get('content-length') || '0', 10);
-        } catch { finalSize = 0; }
-        
-        await sendSpecificVideo(chatId, tweet, topVariant, finalSize, caption);
-      }
+    const defaultTitle = "来自 X (Twitter) 的高清分享";
 
-    } else if (photos.length > 0) {
-      // 纯图片处理，照常携带查询画质键盘（虽然对图片无影响，保证排版一致）
-      const replyMarkup = { inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]] };
-      if (photos.length === 1) {
-        await fetch(`${TELEGRAM_API}/sendPhoto`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, photo: photos[0].url, caption, parse_mode: 'HTML', show_caption_above_media: true, reply_markup: replyMarkup })
-        });
-      } else {
-        const mediaGroup = photos.map((p, idx) => ({
-          type: 'photo', media: p.url, caption: idx === 0 ? caption : '', parse_mode: idx === 0 ? 'HTML' : undefined, show_caption_above_media: idx === 0 ? true : undefined
-        }));
-        await fetch(`${TELEGRAM_API}/sendMediaGroup`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, media: mediaGroup })
-        });
-      }
+    if (finalSelectedVariant) {
+      // 成功级联降级到能发送的文件
+      await sendSpecificVideo(chatId, defaultTitle, finalSelectedVariant, finalSize, originalTwitterUrl);
     } else {
-      await fetch(`${TELEGRAM_API}/sendMessage`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: caption, parse_mode: 'HTML' })
-      });
+      // 如果即便降到 1080p 也全都大于 50MB，则直接抓最高清的那个甩链接
+      const topVariant = sortedVariants[0];
+      try {
+        const hRes = await quickFetch(topVariant.url, { method: 'HEAD' }, 1500);
+        finalSize = parseInt(hRes.headers.get('content-length') || '0', 10);
+      } catch { finalSize = 0; }
+      
+      await sendSpecificVideo(chatId, defaultTitle, topVariant, finalSize, originalTwitterUrl);
     }
 
   } catch (error) {
-    console.error('[总线报错]:', error.message);
+    console.error('[Cobalt 总线报错]:', error.message);
   }
 
   return res.status(200).send('OK');
