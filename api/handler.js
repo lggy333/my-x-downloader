@@ -3,15 +3,19 @@ const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-// 可靠的公共 Cobalt 节点，专门用于深度解析多画质
-const COBALT_API = 'https://api.cobalt.tools'; 
+// 收集了多个目前存活且低调的 Cobalt 公共节点进行轮询，防止单点失效
+const COBALT_NODES = [
+  'https://cobalt.hyonsu.com',
+  'https://api.cobalt.tools',
+  'https://co.wuk.sh'
+];
 
 function escapeHTML(str) {
   if (!str) return '';
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function quickFetch(url, options = {}, timeoutMs = 4000) {
+async function quickFetch(url, options = {}, timeoutMs = 3000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -24,49 +28,68 @@ async function quickFetch(url, options = {}, timeoutMs = 4000) {
   }
 }
 
-// 使用 Cobalt 强力提取 X 贴文的所有画质变体
-async function fetchAllVariantsFromCobalt(tweetUrl) {
-  const resolutions = ['max', '1080', '720', '480', '360'];
-  let variants = [];
-  let urlsSet = new Set();
-
-  // 并发请求多个画质档位，强制 Cobalt 在后端为我们解包
-  const promises = resolutions.map(async (resTag) => {
-    try {
-      const response = await fetch(COBALT_API, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({
-          url: tweetUrl,
-          videoQuality: resTag, 
-          filenamePattern: 'basic'
-        })
-      });
-      if (response.ok) {
-        const data = await response.json();
-        // cobalt 返回 stream 或 url
-        if (data.url && !urlsSet.has(data.url)) {
-          urlsSet.add(data.url);
-          let score = resTag === 'max' ? 2160 : parseInt(resTag, 10);
-          let label = resTag === 'max' ? '高清原画 (Max)' : `${resTag}p`;
-          return { url: data.url, score, label };
-        }
-      }
-    } catch (e) {
-      console.warn(`Cobalt 提取 ${resTag} 失败`);
-    }
-    return null;
-  });
-
-  const results = await Promise.all(promises);
-  variants = results.filter(v => v !== null);
+// 尝试从不同的 Cobalt 节点深度解析多画质
+async function fetchFromCobaltWithFallback(tweetUrl) {
+  const resolutions = ['max', '1080', '720', '480'];
   
-  // 按清晰度从高到低排序
-  return variants.sort((a, b) => b.score - a.score);
+  // 轮询节点
+  for (const node of COBALT_NODES) {
+    try {
+      let variants = [];
+      let urlsSet = new Set();
+      
+      const promises = resolutions.map(async (resTag) => {
+        try {
+          const response = await quickFetch(node, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ url: tweetUrl, videoQuality: resTag, filenamePattern: 'basic' })
+          }, 2500);
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (data.url && !urlsSet.has(data.url)) {
+              urlsSet.add(data.url);
+              let score = resTag === 'max' ? 2160 : parseInt(resTag, 10);
+              let label = resTag === 'max' ? '高清原画 (Max)' : `${resTag}p`;
+              return { url: data.url, score, label };
+            }
+          }
+        } catch (e) {}
+        return null;
+      });
+
+      const results = await Promise.all(promises);
+      variants = results.filter(v => v !== null);
+      
+      if (variants.length > 0) {
+        return variants.sort((a, b) => b.score - a.score);
+      }
+    } catch (err) {
+      console.warn(`节点 ${node} 尝试失败，切换下一节点...`);
+    }
+  }
+  return [];
 }
 
-// 发送特定分辨率的视频流
-async function sendSpecificVideo(chatId, tweetId, tweetText, variant, size, caption) {
+// 终极兜底方案：如果 Cobalt 全挂了，用 FxTwitter 提取单档画质，确保机器人绝不罢工
+async function fetchFxTwitterFallback(tweetId) {
+  try {
+    const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 3000);
+    if (!fxRes.ok) return [];
+    const data = await fxRes.json();
+    const videoUrl = data.tweet?.media?.videos?.[0]?.url;
+    if (videoUrl) {
+      return [{ url: videoUrl, score: 1080, label: '标准画质 (兜底)' }];
+    }
+  } catch (e) {
+    console.error('兜底 FxTwitter 也失败:', e.message);
+  }
+  return [];
+}
+
+// 发送视频的核心业务逻辑
+async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
   const MAX_URL_SIZE = 20 * 1024 * 1024;
   const MAX_BOT_SIZE = 50 * 1024 * 1024;
   
@@ -101,7 +124,7 @@ async function sendSpecificVideo(chatId, tweetId, tweetText, variant, size, capt
     const sizeInMB = size > 0 ? (size / (1024 * 1024)).toFixed(1) : '未知';
     const originalTweetLink = `https://x.com/i/status/${tweetId}`;
     
-    const overSizeCaption = `📝 ${escapeHTML(tweetText)}\n\n⚠️ 提示：该画质过大 (${sizeInMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此下载该高清原片</a> | <a href="${originalTweetLink}">查看原推特</a>`;
+    const overSizeCaption = `⚠️ 提示：该画质过大 (${sizeInMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此下载该高清原片</a> | <a href="${originalTweetLink}">查看原推特</a>`;
     
     await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
@@ -114,7 +137,7 @@ async function sendSpecificVideo(chatId, tweetId, tweetText, variant, size, capt
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // ================= 逻辑分流 A：处理点击按钮面板 =================
+  // ================= 逻辑分流 A：处理点击面板 =================
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
     if (ALLOWED_USER_ID && String(callback.from?.id) !== String(ALLOWED_USER_ID)) {
@@ -136,21 +159,25 @@ export default async function handler(req, res) {
       const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: "🔍 Cobalt 正在多路同步解包各档位文件体积..." })
+        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在多路解析各档位文件体积..." })
       });
       const progressData = await progressRes.json();
       const progressMsgId = progressData.result?.message_id;
 
       try {
         const targetUrl = `https://x.com/i/status/${tweetId}`;
-        const sortedVariants = await fetchAllVariantsFromCobalt(targetUrl);
+        let sortedVariants = await fetchFromCobaltWithFallback(targetUrl);
+        
+        // 如果多节点全挂，清单也用 Fx 兜底
+        if (sortedVariants.length === 0) {
+          sortedVariants = await fetchFxTwitterFallback(tweetId);
+        }
 
         if (sortedVariants.length === 0) {
-          if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: "❌ Cobalt 节点未能成功解析该视频。" }) });
+          if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: "❌ 视频解析失败，所有解析服务暂不可用。" }) });
           return res.status(200).send('OK');
         }
 
-        // 并发探测体积
         const sizePromises = sortedVariants.map(async (v) => {
           try {
             const hRes = await quickFetch(v.url, { method: 'HEAD' }, 2000);
@@ -161,7 +188,7 @@ export default async function handler(req, res) {
 
         const keyboard = [];
         sortedVariants.forEach((v, idx) => {
-          const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '点击探测大小';
+          const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '点击直接投递';
           keyboard.push([{
             text: `${v.label} - ${sizeMB}`,
             callback_data: `send_q:${tweetId}:${idx}`
@@ -174,14 +201,14 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             chat_id: chatId,
             message_id: progressMsgId,
-            text: `📊 <b>推文 [${tweetId}] 完整画质清单 (Cobalt 强力驱动)</b>\n下方多档已成功解锁，点击对应档位即可直接投递文件。`,
+            text: `📊 <b>推文 [${tweetId}] 画质清单</b>\n点击对应档位执行精准投递：`,
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: keyboard }
           })
         });
 
       } catch (err) {
-        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 探测发生异常: ${err.message}` }) });
+        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 异常: ${err.message}` }) });
       }
     }
 
@@ -191,15 +218,19 @@ export default async function handler(req, res) {
 
       try {
         const targetUrl = `https://x.com/i/status/${tweetId}`;
-        const sortedVariants = await fetchAllVariantsFromCobalt(targetUrl);
+        let sortedVariants = await fetchFromCobaltWithFallback(targetUrl);
+        if (sortedVariants.length === 0) {
+          sortedVariants = await fetchFxTwitterFallback(tweetId);
+        }
+        
         const chosenVariant = sortedVariants[targetIdx];
         if (!chosenVariant) return res.status(200).send('OK');
 
         const hRes = await quickFetch(chosenVariant.url, { method: 'HEAD' }, 2000);
         const size = parseInt(hRes.headers.get('content-length') || '0', 10);
 
-        const caption = `🔗 <a href="${targetUrl}">查看原推特</a>\n⚙️ <i>手动指定投递画质: ${chosenVariant.label}</i>`;
-        await sendSpecificVideo(chatId, tweetId, "手动投递视频", chosenVariant, size, caption);
+        const caption = `🔗 <a href="${targetUrl}">查看原推特</a>\n⚙️ <i>指定投递: ${chosenVariant.label}</i>`;
+        await sendSpecificVideo(chatId, tweetId, chosenVariant, size, caption);
       } catch (e) {
         console.error('手动投递失败', e.message);
       }
@@ -208,7 +239,7 @@ export default async function handler(req, res) {
     return res.status(200).send('OK');
   }
 
-  // ================= 逻辑分流 B：处理用户发送的消息 =================
+  // ================= 逻辑分流 B：处理发送消息 =================
   const msg = req.body.message;
   if (!msg || !msg.text) return res.status(200).send('OK');
 
@@ -221,11 +252,7 @@ export default async function handler(req, res) {
   const messageId = msg.message_id;
 
   try {
-    await fetch(`${TELEGRAM_API}/deleteMessage`, {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-    });
+    await fetch(`${TELEGRAM_API}/deleteMessage`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: messageId }) });
   } catch (e) {}
 
   const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
@@ -236,54 +263,59 @@ export default async function handler(req, res) {
   const originalTweetLink = `https://x.com/i/status/${tweetId}`;
 
   try {
-    // 核心改动：不再求助 fxtwitter 那个残缺的元数据，直接走 Cobalt 多路强刷
-    const sortedVariants = await fetchAllVariantsFromCobalt(originalTweetLink);
+    // 1. 优先使用多节点 Cobalt 冲锋，拿多清晰度列表
+    let sortedVariants = await fetchFromCobaltWithFallback(originalTweetLink);
+    let isFallback = false;
+
+    // 2. 如果 Cobalt 节点今天全军覆没，立马启用 FxTwitter 提取单清晰度直链兜底，绝对不报解析失败
+    if (sortedVariants.length === 0) {
+      sortedVariants = await fetchFxTwitterFallback(tweetId);
+      isFallback = true;
+    }
 
     if (sortedVariants.length > 0) {
       let finalSelectedVariant = null;
       let finalSize = 0;
-      const MAX_BOT_SIZE = 50 * 1024 * 1024; // 50MB
+      const MAX_BOT_SIZE = 50 * 1024 * 1024;
 
       // 自动级联降级策略
       for (const variant of sortedVariants) {
-        if (variant.score > 0 && variant.score < 1080) {
-          break; // 熔断保护，低于 1080p 不自动投递
+        if (!isFallback && variant.score > 0 && variant.score < 1080) {
+          break; // 熔断保护
         }
-
         try {
           const hRes = await quickFetch(variant.url, { method: 'HEAD' }, 1500);
           const size = parseInt(hRes.headers.get('content-length') || '0', 10);
-          
           if (size > 0 && size <= MAX_BOT_SIZE) {
             finalSelectedVariant = variant;
             finalSize = size;
             break; 
           }
-        } catch (e) {
-          console.warn('单路探测跳过');
-        }
+        } catch (e) {}
       }
 
       let caption = `🔗 <a href="${originalTweetLink}">查看原推特</a>`;
+      if (isFallback) {
+        caption += `\n⚠️ <i>高级多画质节点正忙，已自动切换到单画质兜底模式</i>`;
+      }
 
       if (finalSelectedVariant) {
-        caption += `\n💡 <i>画质已智能适配调整至: ${finalSelectedVariant.label}</i>`;
-        await sendSpecificVideo(chatId, tweetId, "Twitter 视频", finalSelectedVariant, finalSize, caption);
+        if (!isFallback) caption += `\n💡 <i>画质已智能适配调整至: ${finalSelectedVariant.label}</i>`;
+        await sendSpecificVideo(chatId, tweetId, finalSelectedVariant, finalSize, caption);
       } else {
-        // 全都超限，退回最高画质直链
         const topVariant = sortedVariants[0];
         try {
           const hRes = await quickFetch(topVariant.url, { method: 'HEAD' }, 1500);
           finalSize = parseInt(hRes.headers.get('content-length') || '0', 10);
         } catch {}
-        await sendSpecificVideo(chatId, tweetId, "Twitter 视频", topVariant, finalSize, caption);
+        await sendSpecificVideo(chatId, tweetId, topVariant, finalSize, caption);
       }
     } else {
-      // 如果 Cobalt 解析失败，回退到发送直链的基本文本
+      // 极其罕见的两边都挂了，才下发基础文本
       await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: `⚠️ 视频解析失败，请检查链接或稍后重试。\n🔗 <a href="${originalTweetLink}">原推特直链</a>`, parse_mode: 'HTML' })
+        body: JSON.stringify({ chat_id: chatId, text: `⚠️ 视频网关响应异常，请重试。\n🔗 <a href="${originalTweetLink}">原推特直链</a>`, parse_mode: 'HTML' })
       });
     }
 
