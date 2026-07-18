@@ -231,25 +231,36 @@ function collectVideoVariants(media = {}) {
 // ======================
 // 核心业务：发送流与降级上传 (Part 17)
 // ======================
+// ======================
+// 核心业务：发送流与降级上传 (优化版：支持边播边加载)
+// ======================
 async function sendSpecificVideo(chatId, tweet, variant, size, caption) {
     const tweetId = tweet.id;
     const replyMarkup = {
         inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]]
     };
 
-    // <= 50MB
+    // 基础公共参数
+    const basePayload = {
+        chat_id: chatId,
+        video: variant.url,
+        caption,
+        parse_mode: 'HTML',
+        show_caption_above_media: true,
+        reply_markup: replyMarkup,
+        supports_streaming: true // 【关键新增】开启Telegram流式播放，实现边缓冲边看
+    };
+
+    // 50MB以内：优先走Telegram服务器端拉取（URL直发），失败再降级本地下载上传
     if (size > 0 && size <= CONFIG.BOT_UPLOAD_LIMIT) {
         let urlSent = false;
         
-        // 尝试直接使用 URL 投递
+        // 第一优先级：直接URL投递，Telegram服务器从X CDN拉取，用户可边播边加载
         try {
             const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
                 method: 'POST',
                 headers: JSON_HEADERS,
-                body: JSON.stringify({
-                    chat_id: chatId, video: variant.url, caption, parse_mode: 'HTML',
-                    show_caption_above_media: true, reply_markup: replyMarkup
-                })
+                body: JSON.stringify(basePayload)
             });
             const json = await res.json();
             if (json.ok) {
@@ -258,10 +269,10 @@ async function sendSpecificVideo(chatId, tweet, variant, size, caption) {
                 throw new Error("Direct URL fallback triggered");
             }
         } catch (e) {
-            console.log("URL 发送失败或超时，降级为 Vercel 上传:", e.message);
+            console.log("URL 发送失败，降级为服务器下载上传:", e.message);
         }
 
-        // 如果 URL 直发失败，回退为下载后上传流
+        // 第二优先级：URL直发失败时，回退为下载后上传
         if (!urlSent) {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
             const arrayBuffer = await videoRes.arrayBuffer();
@@ -271,12 +282,13 @@ async function sendSpecificVideo(chatId, tweet, variant, size, caption) {
             formData.append('parse_mode', 'HTML');
             formData.append('show_caption_above_media', 'true');
             formData.append('reply_markup', JSON.stringify(replyMarkup));
+            formData.append('supports_streaming', 'true'); // 上传模式也开启流式支持
             const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
             formData.append('video', videoBlob, 'video.mp4');
             await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
         }
     } else {
-        // > 50MB 下发带按钮的文本直链
+        // > 50MB 超出Bot API限制，下发带按钮的文本直链
         const sizeInMB = size > 0 ? (size / (1024 * 1024)).toFixed(1) : '未知';
         const authorLink = `https://x.com/${tweet.author.screen_name}`;
         const originalTweetLink = `https://x.com/i/status/${tweetId}`;
@@ -289,7 +301,6 @@ async function sendSpecificVideo(chatId, tweet, variant, size, caption) {
         });
     }
 }
-
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
