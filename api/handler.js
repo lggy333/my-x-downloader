@@ -4,13 +4,13 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ======================
-// 全局配置 (V3)
+// 全局配置
 // ======================
 const CONFIG = {
     // Telegram Bot 上传限制
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
-    // 最低展示分辨率（低于此值直接过滤，避免iOS比例异常）
-    MIN_DISPLAY_HEIGHT: 720,
+    // 最低展示分辨率
+    MIN_DISPLAY_HEIGHT: 480,
     // 自动选择最低画质
     AUTO_MIN_HEIGHT: 720,
     // HEAD 超时
@@ -44,12 +44,6 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
         clearTimeout(id);
         throw e;
     }
-}
-
-// 画质档位标签
-function getQualityTag(score) {
-    if (score >= 1080) return '🎬 超清';
-    return '🏆 原画';
 }
 
 // 统一Caption生成：画质→作者→链接→正文
@@ -181,7 +175,7 @@ function dedupeVariants(list) {
 }
 
 // ======================
-// 统一排序规则
+// 统一排序规则（从高到低）
 // ======================
 function compareVariant(a, b) {
     if (a.score !== b.score) return b.score - a.score;
@@ -227,7 +221,7 @@ function parseVideoVariant(v, idx = 0) {
 }
 
 // ======================
-// 收集视频画质 + V3 严格过滤
+// 收集并过滤有效视频画质
 // ======================
 function collectVideoVariants(media = {}) {
     const map = new Map();
@@ -264,23 +258,37 @@ function collectVideoVariants(media = {}) {
     (media.videos || []).forEach(collectFromVideo);
     (media.all_videos || []).forEach(collectFromVideo);
 
-    // V3 核心过滤：只保留有效MP4 + 分辨率达标，彻底规避iOS比例异常
+    // 基础过滤：只保留有效MP4
     return [...map.values()].filter(v => {
-        // 1. 排除HLS流
         if (v.isHLS) return false;
-        // 2. 仅保留MP4格式
         if (!v.url.endsWith('.mp4')) return false;
-        // 3. 过滤异常分辨率
         if (v.width <= 0 || v.height <= 0) return false;
         if (v.width > 7680 || v.height > 7680) return false;
-        // 4. 最低分辨率门槛，移除易出问题的低清档
         if (v.score < CONFIG.MIN_DISPLAY_HEIGHT) return false;
         return true;
     });
 }
 
 // ======================
-// 核心发送函数 (V3：补全宽高参数，优化流式播放)
+// 按钮列表精简：>50MB 全保留，≤50MB 只留最高一档
+// ======================
+function trimVariantsForButton(list) {
+    let hasUnderLimit = false;
+    return list.filter(v => {
+        if (v.size > CONFIG.BOT_UPLOAD_LIMIT) {
+            return true; // 大于50MB的全部保留
+        } else {
+            if (!hasUnderLimit) {
+                hasUnderLimit = true;
+                return true; // 第一个≤50MB的保留
+            }
+            return false; // 后续更低的全部砍掉
+        }
+    });
+}
+
+// ======================
+// 核心发送函数
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
@@ -294,7 +302,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     if (variant.size > 0 && variant.size <= CONFIG.BOT_UPLOAD_LIMIT) {
         let urlSent = false;
         
-        // 第一优先级：URL直发 + 显式传宽高 + 开启流式
+        // 优先URL直发 + 显式宽高 + 流式播放
         try {
             const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
                 method: 'POST',
@@ -307,7 +315,6 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
                     show_caption_above_media: true, 
                     reply_markup: replyMarkup,
                     supports_streaming: true,
-                    // V3 新增：显式指定宽高，辅助iOS正确计算显示比例
                     width: variant.width,
                     height: variant.height
                 })
@@ -322,7 +329,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             console.log("URL 发送失败，降级为服务器下载上传:", e.message);
         }
 
-        // 第二优先级：表单上传兜底，同样补全宽高
+        // 兜底：下载后上传
         if (!urlSent) {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
             const arrayBuffer = await videoRes.arrayBuffer();
@@ -333,7 +340,6 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             formData.append('show_caption_above_media', 'true');
             formData.append('reply_markup', JSON.stringify(replyMarkup));
             formData.append('supports_streaming', 'true');
-            // V3 新增：上传模式也显式传入宽高
             formData.append('width', String(variant.width));
             formData.append('height', String(variant.height));
             const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
@@ -400,17 +406,18 @@ export default async function handler(req, res) {
                 sortedVariants.forEach((v, idx) => v.size = sizes[idx]);
                 sortedVariants.sort(compareVariant);
 
-                // V3 精简按钮：只保留高分辨率档位
+                // 精简按钮列表：≤50MB 只留最高一档
+                const buttonVariants = trimVariantsForButton(sortedVariants);
+
+                // 生成按钮（只显示分辨率 + 大小）
                 const keyboard = [];
-                sortedVariants.forEach((v, idx) => {
+                buttonVariants.forEach((v, idx) => {
                     const sizeMB = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
-                    const mbps = v.bitrate > 1000000 ? `${(v.bitrate/1000000).toFixed(1)}Mbps` : 
-                                 v.bitrate > 0 ? `${Math.round(v.bitrate / 1000)}kbps` : '未知码率';
-                    
-                    const tag = getQualityTag(v.score);
+                    // 注意：这里索引用原始 sortedVariants 的真实索引，保证点击时定位准确
+                    const realIndex = sortedVariants.findIndex(item => item.url === v.url);
                     keyboard.push([{
-                        text: `${tag}（${v.label}） · ${mbps} · ${sizeMB}`,
-                        callback_data: `send_q:${tweetId}:${idx}`
+                        text: `${v.label} · ${sizeMB}`,
+                        callback_data: `send_q:${tweetId}:${realIndex}`
                     }]);
                 });
 
@@ -420,7 +427,7 @@ export default async function handler(req, res) {
                     body: JSON.stringify({
                         chat_id: chatId,
                         message_id: progressMsgId,
-                        text: `📊 <b>推文 [${tweetId}] 画质清单</b>\n均为高分辨率片源，兼容iOS正常比例显示。`,
+                        text: `📊 <b>推文 [${tweetId}] 画质清单</b>`,
                         parse_mode: 'HTML',
                         reply_markup: { inline_keyboard: keyboard }
                     })
@@ -449,7 +456,8 @@ export default async function handler(req, res) {
                 const chosenVariant = sortedVariants[targetIdx];
                 if (!chosenVariant) return res.status(200).send('OK');
 
-                await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true });
+                const isOverSize = chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
+                await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true, isOverSize });
             } catch (e) {
                 console.error('手动投递失败', e.message);
             }
