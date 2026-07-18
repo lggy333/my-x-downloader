@@ -196,11 +196,10 @@ async function getFileSizeInternal(url) {
 }
 
 async function getFileSize(url) {
-    // 移除二次HEAD重试，失败直接走Range兜底，再失败返回0
     return await getFileSizeInternal(url);
 }
 
-// 批量回填size（仅画质列表全量探测时使用）
+// 批量回填size（仅后台预探测使用）
 async function fillVariantsSize(variants) {
     const tasks = variants.map(v => () => getFileSize(v.url));
     const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
@@ -216,17 +215,14 @@ function normalizeVideoUrl(url) {
 }
 
 // ======================
-// 去重：宽高+码率联合去重
+// 优化：同分辨率只保留最高码率版本，减少冗余档位
 // ======================
 function dedupeVariants(list) {
     const map = new Map();
     for (const v of list) {
-        const key = `${v.width}x${v.height}_${v.bitrate}`;
-        if (!map.has(key)) {
-            map.set(key, v);
-            continue;
-        }
-        if (v.bitrate > map.get(key).bitrate) {
+        const key = `${v.width}x${v.height}`;
+        // 同分辨率下只保留码率最高的版本
+        if (!map.has(key) || v.bitrate > map.get(key).bitrate) {
             map.set(key, v);
         }
     }
@@ -260,7 +256,6 @@ function parseVideoVariant(v, idx = 0) {
         }
     }
 
-    // 优化：以高度为画质基准，更符合视频实际清晰度，AUTO_MIN_HEIGHT逻辑更准确
     const score = height;
     const label = width && height ? `${width}×${height}` : `未知画质 ${idx + 1}`;
     const type = v.content_type || v.container || "video/mp4";
@@ -339,9 +334,12 @@ function collectVideoVariants(media = {}) {
 }
 
 // ======================
-// 按钮列表精简：>50MB全保留，≤50MB只留最高一档
+// 按钮列表精简：全部有大小时，>50MB全保留，≤50MB只留最高一档
 // ======================
 function trimVariantsForButton(list) {
+    const allHasSize = list.every(v => v.size > 0);
+    if (!allHasSize) return list; // 未全部探测完则全显示
+
     let foundUnderLimit = false;
     return list.filter(v => {
         if (v.size > CONFIG.BOT_UPLOAD_LIMIT) return true;
@@ -410,11 +408,11 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             formData.append('width', String(variant.width));
             formData.append('height', String(variant.height));
             formData.append('disable_content_type_detection', 'true');
-            // 直接使用响应流，避免完整加载到内存，内存占用减半
             formData.append('video', videoRes.body, 'video.mp4');
             await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
         }
     } else {
+        // 超出50MB：文本直链
         await fetch(`${TELEGRAM_API}/sendMessage`, {
             method: 'POST',
             headers: JSON_HEADERS,
@@ -447,13 +445,13 @@ export default async function handler(req, res) {
             body: JSON.stringify({ callback_query_id: callback.id })
         }).catch(() => {});
 
-        // 画质列表
+        // 画质列表（优化：不强制全量探测，有缓存显示大小，无缓存仅显示分辨率，秒开）
         if (callbackData.startsWith('list_q:')) {
             const tweetId = callbackData.split(':')[1];
             const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
                 method: 'POST',
                 headers: JSON_HEADERS,
-                body: JSON.stringify({ chat_id: chatId, text: "🔍 正在探测画质与体积..." })
+                body: JSON.stringify({ chat_id: chatId, text: "🔍 正在加载画质列表..." })
             });
             const progressData = await progressRes.json();
             const progressMsgId = progressData.result?.message_id;
@@ -470,22 +468,16 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 未探测过则批量探测
-                const hasSizeFilled = baseVariants.every(v => v.size > 0);
-                if (!hasSizeFilled) {
-                    await fillVariantsSize(baseVariants);
-                    cacheData.time = Date.now();
-                }
-
+                // 精简按钮列表
                 const buttonVariants = trimVariantsForButton(baseVariants);
 
-                // 优化：按钮直接携带URL，不依赖索引，排序变化也不会错位
+                // 生成按钮：有大小显示大小，无大小仅显示分辨率
                 const keyboard = [];
                 buttonVariants.forEach((v) => {
-                    const sizeMB = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
+                    const sizeText = v.size > 0 ? ` · ${(v.size / (1024 * 1024)).toFixed(1)} MB` : '';
                     const encodedUrl = encodeURIComponent(v.url);
                     keyboard.push([{
-                        text: `${v.label} · ${sizeMB}`,
+                        text: `${v.label}${sizeText}`,
                         callback_data: `send_q:${tweetId}:${encodedUrl}`
                     }]);
                 });
@@ -501,6 +493,14 @@ export default async function handler(req, res) {
                         reply_markup: { inline_keyboard: keyboard }
                     })
                 });
+
+                // 后台静默预探测剩余大小，不阻塞返回
+                (async () => {
+                    try {
+                        await fillVariantsSize(baseVariants);
+                        cacheData.time = Date.now();
+                    } catch {}
+                })();
             } catch (err) {
                 if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { 
                     method: 'POST', 
@@ -510,7 +510,7 @@ export default async function handler(req, res) {
             }
         }
 
-        // 指定画质发送（优化：只探测当前点击的档位，不全部探测）
+        // 指定画质发送（仅探测当前选中的档位）
         if (callbackData.startsWith('send_q:')) {
             const [, tweetId, encodedUrl] = callbackData.split(':');
             const targetUrl = decodeURIComponent(encodedUrl);
@@ -520,11 +520,10 @@ export default async function handler(req, res) {
                 const { tweet, baseVariants } = cacheData;
                 if (!tweet) return res.status(200).send('OK');
 
-                // 按URL定位目标档位
                 const chosenVariant = baseVariants.find(v => v.url === targetUrl);
                 if (!chosenVariant) return res.status(200).send('OK');
 
-                // 只探测当前档位的大小，不浪费请求
+                // 仅探测当前档位大小
                 if (chosenVariant.size === 0) {
                     chosenVariant.size = await getFileSize(chosenVariant.url);
                     cacheData.time = Date.now();
@@ -539,7 +538,7 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
     }
 
-    // ================= 用户消息处理（自动发送 + 后台预探测）
+    // ================= 用户消息处理（自动选档：50MB内选最大体积）
     const msg = req.body.message;
     if (!msg || !msg.text) return res.status(200).send('OK');
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
@@ -572,7 +571,7 @@ export default async function handler(req, res) {
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
-            // 逐个探测，找到第一个符合条件的立即停止
+            // 核心优化：遍历所有档位，记录50MB以内体积最大的最优解
             let best = null;
             for (const variant of baseVariants) {
                 variant.size = await getFileSize(variant.url);
@@ -581,12 +580,14 @@ export default async function handler(req, res) {
                     variant.size <= CONFIG.BOT_UPLOAD_LIMIT &&
                     variant.score >= CONFIG.AUTO_MIN_HEIGHT
                 ) {
-                    best = variant;
-                    break;
+                    // 始终选择体积更大的版本，充分利用50MB上限
+                    if (!best || variant.size > best.size) {
+                        best = variant;
+                    }
                 }
             }
 
-            // 优化：后台异步预探测剩余所有档位，不阻塞发送，后续点按钮秒出
+            // 后台异步预探测剩余所有档位大小，不阻塞发送
             (async () => {
                 try {
                     for (const v of baseVariants) {
@@ -603,6 +604,7 @@ export default async function handler(req, res) {
             if (best) {
                 await sendSpecificVideo(chatId, tweet, best, { autoSelected: true });
             } else {
+                // 全部超限，取最高画质走超限逻辑
                 const topVariant = baseVariants[0];
                 topVariant.size = topVariant.size || await getFileSize(topVariant.url);
                 await sendSpecificVideo(chatId, tweet, topVariant, { isOverSize: true });
