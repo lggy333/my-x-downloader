@@ -35,7 +35,7 @@ export default async function handler(req, res) {
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
 
-  // 【核心新增】只要你发了消息，不管是不是 X 链接，立刻无条件尝试删除原消息
+  // 1. 无条件立刻强行同步删除原消息（确保 Vercel 完整等待 TG 响应）
   try {
     await fetch(`${TELEGRAM_API}/deleteMessage`, {
       method: 'POST',
@@ -46,7 +46,7 @@ export default async function handler(req, res) {
     console.error('删除原消息失败:', e.message);
   }
 
-  // 之后再进行正则匹配，如果不是 X 链接，代码到这里就静默结束（原消息已被删）
+  // 2. 检测是否包含 X 链接，如果没有，这里就直接结束（原消息此时已被删）
   const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
   const match = text.match(twitterRegex);
   if (!match) return res.status(200).send('OK'); 
@@ -63,8 +63,9 @@ export default async function handler(req, res) {
     if (!tweet) return res.status(200).send('OK');
 
     const safeText = escapeHTML(tweet.text);
-    const authorLink = `https://twitter.com/${tweet.author.screen_name}`;
-    const originalTweetLink = `https://twitter.com/i/status/${tweetId}`;
+    // 【恢复】域名全部换回标准的 x.com
+    const authorLink = `https://x.com/${tweet.author.screen_name}`;
+    const originalTweetLink = `https://x.com/i/status/${tweetId}`;
     
     const caption = `📝 ${safeText}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n🔗 <a href="${originalTweetLink}">查看原推特</a>`;
 
