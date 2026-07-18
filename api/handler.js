@@ -10,11 +10,11 @@ const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,   // Telegram 单文件上传上限 50MB
     MIN_DISPLAY_HEIGHT: 480,              // 最低有效画质高度
     AUTO_MIN_HEIGHT: 720,                 // 自动选择的最低画质高度
-    HEAD_TIMEOUT: 1800,                    // HEAD 请求超时（ms）
+    HEAD_TIMEOUT: 1800,                   // HEAD 请求超时（ms）
     DOWNLOAD_TIMEOUT: 20000,               // 视频下载超时（ms）
     TWEET_CACHE_MS: 5 * 60 * 1000,        // 推文数据缓存时长 5分钟
     SIZE_CACHE_MS: 10 * 60 * 1000,        // 文件大小缓存时长 10分钟
-    MAX_CACHE: 300,                        // LRU 缓存最大条目数
+    MAX_CACHE: 300,                       // LRU 缓存最大条目数
     HEAD_CONCURRENCY: 3,                   // 体积探测最大并发数
     URL_SEND_RETRY_DELAY: 200              // URL 直发失败重试间隔（ms）
 };
@@ -395,29 +395,29 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         }
 
         // 兜底：流式上传
-if (!urlSent) {
-    const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
-    
-    // ✅ 修复：将 ReadableStream 完全读取到内存并转换为 Blob
-    const arrayBuffer = await videoRes.arrayBuffer(); 
-    const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
+        if (!urlSent) {
+            const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
+            
+            // ✅ 修复：将 ReadableStream 完全读取到内存并转换为 Blob
+            const arrayBuffer = await videoRes.arrayBuffer(); 
+            const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
 
-    const formData = new FormData();
-    formData.append('chat_id', String(chatId));
-    formData.append('caption', caption);
-    formData.append('parse_mode', 'HTML');
-    formData.append('show_caption_above_media', 'true');
-    formData.append('reply_markup', JSON.stringify(replyMarkup));
-    formData.append('supports_streaming', 'true');
-    formData.append('width', String(variant.width));
-    formData.append('height', String(variant.height));
-    formData.append('disable_content_type_detection', 'true');
-    
-    // ✅ 修复：将转换好的 Blob 追加进 formData
-    formData.append('video', videoBlob, 'video.mp4');
-    
-    await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
-}
+            const formData = new FormData();
+            formData.append('chat_id', String(chatId));
+            formData.append('caption', caption);
+            formData.append('parse_mode', 'HTML');
+            formData.append('show_caption_above_media', 'true');
+            formData.append('reply_markup', JSON.stringify(replyMarkup));
+            formData.append('supports_streaming', 'true');
+            formData.append('width', String(variant.width));
+            formData.append('height', String(variant.height));
+            formData.append('disable_content_type_detection', 'true');
+            
+            // ✅ 修复：将转换好的 Blob 追加进 formData
+            formData.append('video', videoBlob, 'video.mp4');
+            
+            await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+        }
     } 
     // 体积超限：发送文字消息+下载链接
     else {
@@ -444,10 +444,13 @@ export default async function handler(req, res) {
     // ---------- 1. 处理回调按钮事件 ----------
     if (req.body.callback_query) {
         const callback = req.body.callback_query;
-        // 白名单校验
+        
+        // 白名单校验 (已注释，解决按钮点击无响应的问题)
+        /*
         if (ALLOWED_USER_ID && String(callback.from?.id) !== String(ALLOWED_USER_ID)) {
             return res.status(200).send('OK');
         }
+        */
 
         const chatId = callback.message.chat.id;
         const callbackData = callback.data;
@@ -555,7 +558,6 @@ export default async function handler(req, res) {
     if (!msg || !msg.text) return res.status(200).send('OK');
 
     // 2. 【关键修改】注释掉或者直接删掉 ALLOWED_USER_ID 的校验
-    // 这样只要机器人被拉进的群，或者私聊它，它都会处理链接
     /*
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
         return res.status(200).send('OK');
@@ -576,17 +578,6 @@ export default async function handler(req, res) {
     } catch (e) {
         // 如果删不掉，说明没权限或不是管理员，为了防止阻塞，打印一下即可
         console.log('无法删除消息，请检查机器人是否为管理员');
-    }
-
-    // 自动删除用户触发消息
-    try {
-        await fetch(`${TELEGRAM_API}/deleteMessage`, {
-            method: 'POST',
-            headers: JSON_HEADERS,
-            body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-        });
-    } catch (e) {
-        console.error('删除消息权限不足:', e.message);
     }
 
     // ========== 新增：/start 命令处理 ==========
