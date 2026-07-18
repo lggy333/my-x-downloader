@@ -3,12 +3,7 @@ const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-function escapeHTML(str) {
-  if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-async function quickFetch(url, options = {}, timeoutMs = 3500) {
+async function quickFetch(url, options = {}, timeoutMs = 4000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -21,46 +16,91 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
   }
 }
 
-// 核心经验：既然直接拿不到多档 MP4，我们就利用媒体服务器的重定向机制，人工构建高/中/低多码率的直投链路
-function generateDynamicVariants(tweetId, originalBestUrl) {
+// 核心突破：利用免登录的高级多画质聚合探测器（不再依赖不稳定的重定向路由）
+async function getCleanVariants(tweetId) {
+  const tweetUrl = `https://x.com/i/status/${tweetId}`;
   const variants = [];
-  
-  // 档位 1：绝对的高清原画（使用当前抓到的最好直链）
-  variants.push({
-    url: originalBestUrl,
-    score: 1080,
-    label: '🔥 超清原画 (直连投递)'
+
+  // 默认兜底：直接调取 FxTwitter 官方的主原画 MP4
+  try {
+    const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 2500);
+    if (fxRes.ok) {
+      const data = await fxRes.json();
+      const bestVideo = data.tweet?.media?.videos?.[0]?.url;
+      if (bestVideo && bestVideo.includes('.mp4')) {
+        variants.push({ url: bestVideo, score: 1080, label: '🔥 超清 1080p 原画 (官方直连)' });
+      }
+    }
+  } catch (e) {}
+
+  // 动态裂变：通过 Cobalt 不同的画质参数，强行向分布式节点索要不同分辨率的真实 MP4 直链
+  const qualities = [
+    { q: '1080', score: 1080, label: '🎬 极致超清 1080p' },
+    { q: '720', score: 720, label: '⚡ 高清 720p (推荐/省流量)' },
+    { q: '480', score: 480, label: '清晰 480p' },
+    { q: '360', score: 360, label: '🍃 流畅 360p' }
+  ];
+
+  // 并发向免费节点池索要真实的 MP4 物理直链
+  const cobaltPromises = qualities.map(async (item) => {
+    try {
+      const res = await quickFetch('https://co.wuk.sh/api/json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ url: tweetUrl, videoQuality: item.q, filenamePattern: 'basic' })
+      }, 2500);
+      if (res.ok) {
+        const d = await res.json();
+        if (d && d.url && !d.url.includes('.json')) {
+          return { url: d.url, score: item.score, label: item.label };
+        }
+      }
+    } catch (e) {}
+    return null;
   });
 
-  // 档位 2：利用 vxtwitter 的流媒体网关强转 720p 码率层
-  variants.push({
-    url: `https://api.vxtwitter.com/i/status/${tweetId}/video/1`,
-    score: 720,
-    label: '⚡ 高清 720p (智能压缩流)'
-  });
+  const cobaltResults = await Promise.all(cobaltPromises);
+  cobaltResults.forEach(v => { if (v) variants.push(v); });
 
-  // 档位 3：利用 ddtwitter 的流媒体低码率压缩层
-  variants.push({
-    url: `https://v.ddtwit.com/i/status/${tweetId}`,
-    score: 480,
-    label: '🍃 标清 480p (省流量/秒开)'
-  });
+  // 去重并按清晰度从高到低排序
+  const uniqueUrls = new Set();
+  const finalVariants = [];
+  for (const v of variants) {
+    if (!uniqueUrls.has(v.url)) {
+      uniqueUrls.add(v.url);
+      finalVariants.push(v);
+    }
+  }
 
-  return variants;
+  // 如果什么都没捞到，强行给一个可以正常播放的通用流
+  if (finalVariants.length === 0) {
+    finalVariants.push({
+      url: `https://api.vxtwitter.com/i/status/${tweetId}/video/0`,
+      score: 720,
+      label: '📺 智能适配画质通道'
+    });
+  }
+
+  return finalVariants.sort((a, b) => b.score - a.score);
 }
 
-// 核心突破：高级视频发送器（支持体积超限时，强行嵌入 Telegram 原生内置播放器）
+// 核心修复：绝对不会发成 JSON 文件的纯净投递器
 async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
   const MAX_URL_SIZE = 20 * 1024 * 1024;
   const MAX_BOT_SIZE = 50 * 1024 * 1024;
   
   const replyMarkup = {
-    inline_keyboard: [[{ text: "📊 切换其他画质/多码率通道", callback_data: `list_q:${tweetId}` }]]
+    inline_keyboard: [[{ text: "📊 切换其他画质通道", callback_data: `list_q:${tweetId}` }]]
   };
 
-  // 情况 1：文件很小，直接用普通 URL 投递，秒发
+  // 严格过滤：如果链接看起来就不像一个视频流，或者太小（比如那 1.2KB 的 json 错误返回），直接走直链通知
+  if (size > 0 && size < 5000) {
+    size = 0; 
+  }
+
+  // 情况 1：体积在 Telegram 允许的 URL 直发范围内 (小于 20MB)
   if (size > 0 && size <= MAX_URL_SIZE) {
-    await fetch(`${TELEGRAM_API}/sendVideo`, {
+    const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ 
@@ -68,13 +108,21 @@ async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
         show_caption_above_media: true, reply_markup: replyMarkup 
       })
     });
+    if (res.ok) return; // 发送成功，直接结束
   } 
-  // 情况 2：文件在 20MB ~ 50MB 之间，Vercel 内存下载并作为文件硬塞给 Telegram
-  else if (size > MAX_URL_SIZE && size <= MAX_BOT_SIZE) {
+  
+  // 情况 2：体积在 20MB ~ 50MB 之间，由 Vercel 下载缓冲后硬塞给 Telegram 文件服务器
+  if (size > MAX_URL_SIZE && size <= MAX_BOT_SIZE) {
     try {
       const videoRes = await quickFetch(variant.url, {}, 8000); 
       const arrayBuffer = await videoRes.arrayBuffer();
+      const contentType = videoRes.headers.get('content-type') || '';
       
+      // 漏洞拦截：如果抓下来发现根本不是视频，而是 json 报错文本，直接抛出异常走兜底
+      if (contentType.includes('json') || arrayBuffer.byteLength < 5000) {
+        throw new Error('Not a real video stream');
+      }
+
       const formData = new FormData();
       formData.append('chat_id', String(chatId));
       formData.append('caption', caption);
@@ -84,50 +132,36 @@ async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
       
       const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
       formData.append('video', videoBlob, 'video.mp4');
-      await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+      
+      const res = await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+      if (res.ok) return;
     } catch (e) {
-      // 如果硬塞失败，降级到情况 3
-      size = 0; 
+      console.error('内存缓冲投递失败:', e.message);
     }
   } 
   
-  // 情况 3：【破局关键】文件 > 50MB 触发超限，不再发冷冰冰的文本！
-  // 我们直接把流媒体链接伪装发给 Telegram，强行激活 Telegram 的内置画质自适应流媒体播放器！
-  if (size === 0 || size > MAX_BOT_SIZE) {
-    const sizeInMB = size > 0 ? (size / (1024 * 1024)).toFixed(1) : '超大';
-    const streamCaption = `${caption}\n\n⚠️ <b>提示</b>：该清晰度文件过大 (${sizeInMB}MB)。\n🚀 <b>已为你激活 Telegram 官方云流媒体播放转换</b>，无需下载，直接点击下方视频即可原画流畅播放！`;
-
-    // 强行使用 sendVideo 传递大文件直链，Telegram 服务器会接管这部分流，并在聊天界面内生成可播放的视频框！
-    const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ 
-        chat_id: chatId, 
-        video: variant.url, 
-        caption: streamCaption, 
-        parse_mode: 'HTML',
-        supports_streaming: true, // 核心：开启 Telegram 原生流媒体边下边播支持
-        reply_markup: replyMarkup 
-      })
-    });
-
-    // 如果 Telegram 官方因为文件太大拒绝了该直链，我们再最后退守到文本直链，确保稳如老狗
-    if (!res.ok) {
-      const originalTweetLink = `https://x.com/i/status/${tweetId}`;
-      const overSizeCaption = `📝 视频文件过大 且 触发 Telegram 限制\n🚀 <a href="${variant.url}">点此无损下载该视频</a> | <a href="${originalTweetLink}">查看原推特</a>`;
-      await fetch(`${TELEGRAM_API}/sendMessage`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: overSizeCaption, parse_mode: 'HTML', reply_markup: replyMarkup })
-      });
-    }
-  }
+  // 最终绝对安全的降级方案：大文件（如你的 74.4 MB 视频）或者无法被 TG 识别的流
+  // 不再盲目强推 sendVideo（会导致生成 json 乱码文件），直接给清晰漂亮的无损直链下载卡片！
+  const sizeInMB = size > 0 ? (size / (1024 * 1024)).toFixed(1) : '超大';
+  const textCaption = `🎬 <b>视频解析成功！</b>\n🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>当前通道: ${variant.label}</i>\n\n⚠️ <b>提示</b>：由于该档位视频体积高达 <b>${sizeInMB} MB</b>，已超过 Telegram 机器人免下载播放的上限（50MB）。\n\n🚀 <b>请直接点击下方链接无损下载并在手机本地播放：</b>\n👉 <a href="${variant.url}"><b>【点击下载/在浏览器中打开视频】</b></a>`;
+  
+  await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ 
+      chat_id: chatId, 
+      text: textCaption, 
+      parse_mode: 'HTML', 
+      reply_markup: replyMarkup,
+      disable_web_page_preview: false // 开启网页预览，如果链接支持，TG 会在文本下方自动生成可播放的视频框！
+    })
+  });
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // ================= 逻辑分流 A：处理交互面板 =================
+  // ================= 逻辑分流 A：处理控制面板回调 =================
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
     if (ALLOWED_USER_ID && String(callback.from?.id) !== String(ALLOWED_USER_ID)) {
@@ -149,35 +183,30 @@ export default async function handler(req, res) {
       const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: "🔄 正在调度动态码率重定向网关..." })
+        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在重新清洗多档真实 MP4 画质直链..." })
       });
       const progressData = await progressRes.json();
       const progressMsgId = progressData.result?.message_id;
 
       try {
-        // 先拿到原厂的主直链作为基准
-        let originalBestUrl = '';
-        const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 2500);
-        if (fxRes.ok) {
-          originalBestUrl = (await fxRes.json()).tweet?.media?.videos?.[0]?.url || '';
-        }
-        if (!originalBestUrl) originalBestUrl = `https://api.vxtwitter.com/i/status/${tweetId}/video/0`;
+        const sortedVariants = await getCleanVariants(tweetId);
 
-        // 核心生成：人工构建多档独立重定向画质线路
-        const sortedVariants = generateDynamicVariants(tweetId, originalBestUrl);
-
-        // 并发探测体积
+        // 并发探测真实体积
         const sizePromises = sortedVariants.map(async (v) => {
           try {
             const hRes = await quickFetch(v.url, { method: 'HEAD' }, 2000);
-            return parseInt(hRes.headers.get('content-length') || '0', 10);
+            const size = parseInt(hRes.headers.get('content-length') || '0', 10);
+            const type = hRes.headers.get('content-type') || '';
+            // 过滤无效的 json 响应
+            if (type.includes('json') || size < 5000) return 0;
+            return size;
           } catch { return 0; }
         });
         const sizes = await Promise.all(sizePromises);
 
         const keyboard = [];
         sortedVariants.forEach((v, idx) => {
-          const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '云端动态解析';
+          const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '原厂有声直连';
           keyboard.push([{
             text: `${v.label} - ${sizeMB}`,
             callback_data: `send_q:${tweetId}:${idx}`
@@ -190,14 +219,14 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             chat_id: chatId,
             message_id: progressMsgId,
-            text: `📊 <b>多码率分级画质选择面板 (已突破限制)</b>\n如果你发现默认发送的视频卡顿或文件过大，请在下方手动切换：`,
+            text: `📊 <b>请选择你想要切换的真实画质档位</b>\n(若大文件在手机上无法直接播放，请切换到 720p 或标清尝试) :`,
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: keyboard }
           })
         });
 
       } catch (err) {
-        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 发生异常: ${err.message}` }) });
+        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 探测发生故障: ${err.message}` }) });
       }
     }
 
@@ -206,18 +235,17 @@ export default async function handler(req, res) {
       const targetIdx = parseInt(indexStr, 10);
 
       try {
-        let originalBestUrl = `https://api.vxtwitter.com/i/status/${tweetId}/video/0`;
-        const sortedVariants = generateDynamicVariants(tweetId, originalBestUrl);
+        const sortedVariants = await getCleanVariants(tweetId);
         const chosenVariant = sortedVariants[targetIdx];
         if (!chosenVariant) return res.status(200).send('OK');
 
         const hRes = await quickFetch(chosenVariant.url, { method: 'HEAD' }, 2000);
         const size = parseInt(hRes.headers.get('content-length') || '0', 10);
 
-        const caption = `🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>手动切换通道: ${chosenVariant.label}</i>`;
+        const caption = `🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>手动强选通道: ${chosenVariant.label}</i>`;
         await sendSpecificVideo(chatId, tweetId, chosenVariant, size, caption);
       } catch (e) {
-        console.error('手动切换投递失败', e.message);
+        console.error('手动指定通道投递失败', e.message);
       }
     }
 
@@ -248,56 +276,52 @@ export default async function handler(req, res) {
   const originalTweetLink = `https://x.com/i/status/${tweetId}`;
 
   try {
-    // 1. 极速拿到原厂视频的最高画质直链
-    let originalBestUrl = '';
-    const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 2500);
-    if (fxRes.ok) {
-      originalBestUrl = (await fxRes.json()).tweet?.media?.videos?.[0]?.url || '';
-    }
-    if (!originalBestUrl) originalBestUrl = `https://api.vxtwitter.com/i/status/${tweetId}/video/0`;
+    const sortedVariants = await getCleanVariants(tweetId);
 
-    // 2. 人工裂变出多码率、多网关的动态画质列表
-    const sortedVariants = generateDynamicVariants(tweetId, originalBestUrl);
+    if (sortedVariants.length > 0) {
+      let finalSelectedVariant = null;
+      let finalSize = 0;
+      const MAX_BOT_SIZE = 50 * 1024 * 1024; // 智能自动匹配 50MB 播放天花板
 
-    let finalSelectedVariant = null;
-    let finalSize = 0;
-    const MAX_BOT_SIZE = 50 * 1024 * 1024; // 50MB 自动降级线
-
-    // 3. 级联智能降级匹配
-    for (const variant of sortedVariants) {
-      // 熔断限制：如果超过 1 档，且低于 1080p，不再为自动投递降级（防止画质太烂）
-      if (variant.score < 1080) {
-        break; 
+      // 寻找一个小于 50MB 且能直接发送并在 TG 内直接点开播放的优秀档位
+      for (const variant of sortedVariants) {
+        try {
+          const hRes = await quickFetch(variant.url, { method: 'HEAD' }, 1500);
+          const size = parseInt(hRes.headers.get('content-length') || '0', 10);
+          const type = hRes.headers.get('content-type') || '';
+          
+          if (size > 0 && size <= MAX_BOT_SIZE && !type.includes('json')) {
+            finalSelectedVariant = variant;
+            finalSize = size;
+            break; 
+          }
+        } catch (e) {}
       }
-      try {
-        const hRes = await quickFetch(variant.url, { method: 'HEAD' }, 1500);
-        const size = parseInt(hRes.headers.get('content-length') || '0', 10);
-        
-        if (size > 0 && size <= MAX_BOT_SIZE) {
-          finalSelectedVariant = variant;
-          finalSize = size;
-          break; 
-        }
-      } catch (e) {}
-    }
 
-    let caption = `🔗 <a href="${originalTweetLink}">查看原推特</a>`;
+      let caption = `🔗 <a href="${originalTweetLink}">查看原推特</a>`;
 
-    if (finalSelectedVariant) {
-      caption += `\n💡 <i>完美适配，以最高品质投递: ${finalSelectedVariant.label}</i>`;
-      await sendSpecificVideo(chatId, tweetId, finalSelectedVariant, finalSize, caption);
+      if (finalSelectedVariant) {
+        caption += `\n💡 <i>已自动为你筛选适配可在 TG 内直播的画质: ${finalSelectedVariant.label}</i>`;
+        await sendSpecificVideo(chatId, tweetId, finalSelectedVariant, finalSize, caption);
+      } else {
+        // 如果全系列都超过了 50MB（如你截图里的 74.4MB），则直接提取第一档最清晰的，走直链无损下载逻辑
+        const topVariant = sortedVariants[0];
+        try {
+          const hRes = await quickFetch(topVariant.url, { method: 'HEAD' }, 1500);
+          finalSize = parseInt(hRes.headers.get('content-length') || '0', 10);
+        } catch {}
+        await sendSpecificVideo(chatId, tweetId, topVariant, finalSize, caption);
+      }
     } else {
-      // 4. 【破局点】如果最高画质 > 50MB 且降级失败，直接把最顶级的原画交给 Telegram 官方流媒体托管发送！
-      const topVariant = sortedVariants[0];
-      try {
-        const hRes = await quickFetch(topVariant.url, { method: 'HEAD' }, 1500);
-        finalSize = parseInt(hRes.headers.get('content-length') || '0', 10);
-      } catch {}
-      await sendSpecificVideo(chatId, tweetId, topVariant, finalSize, caption);
+      await fetch(`${TELEGRAM_API}/sendMessage`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ chat_id: chatId, text: `⚠️ 解析失败，未在全网捕获到有效的物理 MP4 流。\n🔗 <a href="${originalTweetLink}">原推特直链</a>`, parse_mode: 'HTML' })
+      });
     }
 
   } catch (error) {
-    console.error('[破局总线异常]:', error.message);
+    console.error('[总线拦截报错]:', error.message);
   }
 
   return res.status(200).send('OK');
