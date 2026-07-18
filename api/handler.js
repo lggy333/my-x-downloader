@@ -394,22 +394,30 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             }
         }
 
-        // 兜底：流式上传，直接使用响应流，避免全量加载到内存
-        if (!urlSent) {
-            const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
-            const formData = new FormData();
-            formData.append('chat_id', String(chatId));
-            formData.append('caption', caption);
-            formData.append('parse_mode', 'HTML');
-            formData.append('show_caption_above_media', 'true');
-            formData.append('reply_markup', JSON.stringify(replyMarkup));
-            formData.append('supports_streaming', 'true');
-            formData.append('width', String(variant.width));
-            formData.append('height', String(variant.height));
-            formData.append('disable_content_type_detection', 'true');
-            formData.append('video', videoRes.body, 'video.mp4');
-            await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
-        }
+        // 兜底：流式上传
+if (!urlSent) {
+    const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
+    
+    // ✅ 修复：将 ReadableStream 完全读取到内存并转换为 Blob
+    const arrayBuffer = await videoRes.arrayBuffer(); 
+    const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
+
+    const formData = new FormData();
+    formData.append('chat_id', String(chatId));
+    formData.append('caption', caption);
+    formData.append('parse_mode', 'HTML');
+    formData.append('show_caption_above_media', 'true');
+    formData.append('reply_markup', JSON.stringify(replyMarkup));
+    formData.append('supports_streaming', 'true');
+    formData.append('width', String(variant.width));
+    formData.append('height', String(variant.height));
+    formData.append('disable_content_type_detection', 'true');
+    
+    // ✅ 修复：将转换好的 Blob 追加进 formData
+    formData.append('video', videoBlob, 'video.mp4');
+    
+    await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+}
     } 
     // 体积超限：发送文字消息+下载链接
     else {
