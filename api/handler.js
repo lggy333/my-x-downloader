@@ -3,7 +3,6 @@ const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-// HTML 安全转义，防止推文自带特殊符号导致 TG 报错拒收
 function escapeHTML(str) {
   if (!str) return '';
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -50,12 +49,11 @@ export default async function handler(req, res) {
     const tweet = fxData.tweet;
     if (!tweet) return res.status(200).send('OK');
 
-    // 重新编排的极简精美格式
     const safeText = escapeHTML(tweet.text);
-    const authorLink = `https://x.com/${tweet.author.screen_name}`;
-    const originalTweetLink = `https://x.com/i/status/${tweetId}`;
+    // 【优化】全部切回旧版 twitter.com 域名，利用 TG 客户端的白名单机制减少/免去弹窗警告
+    const authorLink = `https://twitter.com/${tweet.author.screen_name}`;
+    const originalTweetLink = `https://twitter.com/i/status/${tweetId}`;
     
-    // 作者名挂载跳转链接，长链接收纳进最后一行“查看原推特”中
     const caption = `📝 ${safeText}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n🔗 <a href="${originalTweetLink}">查看原推特</a>`;
 
     const media = tweet.media || {};
@@ -77,10 +75,17 @@ export default async function handler(req, res) {
       const MAX_BOT_SIZE = 50 * 1024 * 1024; 
 
       if (contentLength > 0 && contentLength <= MAX_URL_SIZE) {
+        // 【优化】加入 show_caption_above_media: true 让文字强行置顶
         await fetch(`${TELEGRAM_API}/sendVideo`, {
           method: 'POST',
           headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, video: videoUrl, caption, parse_mode: 'HTML' })
+          body: JSON.stringify({ 
+            chat_id: chatId, 
+            video: videoUrl, 
+            caption, 
+            parse_mode: 'HTML',
+            show_caption_above_media: true 
+          })
         });
       } else if (contentLength > MAX_URL_SIZE && contentLength <= MAX_BOT_SIZE) {
         const videoRes = await quickFetch(videoUrl, {}, 5000); 
@@ -90,13 +95,15 @@ export default async function handler(req, res) {
         formData.append('chat_id', String(chatId));
         formData.append('caption', caption);
         formData.append('parse_mode', 'HTML');
+        // 【优化】FormData 模式下同样注入置顶参数
+        formData.append('show_caption_above_media', 'true');
         
         const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
         formData.append('video', videoBlob, 'video.mp4');
 
         await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
       } else {
-        // 大于 50MB 的超大视频排版同步优化
+        // 超大视频文本逻辑
         const sizeInMB = contentLength > 0 ? (contentLength / (1024 * 1024)).toFixed(1) : '未知';
         const overSizeCaption = `📝 ${safeText}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n\n⚠️ 提示：视频过大 (${sizeInMB}MB) 无法直接保存\n🚀 <a href="${videoUrl}">点此下载高清原片</a> | <a href="${originalTweetLink}">查看原推特</a>`;
         
@@ -111,14 +118,21 @@ export default async function handler(req, res) {
         await fetch(`${TELEGRAM_API}/sendPhoto`, {
           method: 'POST',
           headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, photo: photos[0].url, caption, parse_mode: 'HTML' })
+          body: JSON.stringify({ 
+            chat_id: chatId, 
+            photo: photos[0].url, 
+            caption, 
+            parse_mode: 'HTML',
+            show_caption_above_media: true 
+          })
         });
       } else {
         const mediaGroup = photos.map((p, idx) => ({
           type: 'photo',
           media: p.url,
           caption: idx === 0 ? caption : '',
-          parse_mode: idx === 0 ? 'HTML' : undefined
+          parse_mode: idx === 0 ? 'HTML' : undefined,
+          show_caption_above_media: idx === 0 ? true : undefined
         }));
         await fetch(`${TELEGRAM_API}/sendMediaGroup`, {
           method: 'POST',
