@@ -16,7 +16,7 @@ const CONFIG = {
     SIZE_CACHE_MS: 10 * 60 * 1000,
     MAX_CACHE: 300,
     HEAD_CONCURRENCY: 3,
-    URL_SEND_RETRY_DELAY: 200 // URL发送失败重试间隔
+    URL_SEND_RETRY_DELAY: 200
 };
 
 // ======================
@@ -98,34 +98,30 @@ function cacheSet(cache, key, value) {
 }
 
 // ======================
-// Tweet 缓存（优化：Promise级去重，并发请求只发一次）
+// Tweet 缓存（Promise级去重）
 // ======================
 const tweetCache = new Map();
-const tweetPending = new Map(); // 正在进行中的请求Promise
+const tweetPending = new Map();
 
 async function getTweet(tweetId) {
-    // 命中已完成缓存
     const cached = tweetCache.get(tweetId);
     if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
         return cached;
     }
 
-    // 命中进行中的请求，直接复用Promise
     if (tweetPending.has(tweetId)) {
         return tweetPending.get(tweetId);
     }
 
-    // 发起新请求，缓存Promise
     const requestPromise = (async () => {
         try {
             const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`);
             if (!fxRes.ok) throw new Error("解析失败");
             const json = await fxRes.json();
 
-            // 解析并预排序变体列表
             const rawVariants = collectVideoVariants(json.tweet.media);
             const baseVariants = dedupeVariants(rawVariants);
-            baseVariants.sort(compareVariant); // 仅排序一次，缓存后复用
+            baseVariants.sort(compareVariant);
 
             const cacheData = {
                 time: Date.now(),
@@ -144,32 +140,52 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（优化：Promise级去重，同一URL并发只发一次HEAD）
+// 文件大小缓存（Promise级去重 + Range请求兜底）
 // ======================
 const sizeCache = new Map();
-const sizePending = new Map(); // 正在进行中的HEAD请求Promise
+const sizePending = new Map();
 
 async function getFileSizeInternal(url) {
-    // 命中已完成缓存
     const cached = sizeCache.get(url);
     if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
         return cached.size;
     }
 
-    // 命中进行中的请求，直接复用Promise
     if (sizePending.has(url)) {
         return sizePending.get(url);
     }
 
-    // 发起新HEAD请求，缓存Promise
     const requestPromise = (async () => {
         try {
+            // 第一优先级：HEAD请求
             const hRes = await quickFetch(url, { method: "HEAD" }, CONFIG.HEAD_TIMEOUT);
-            const size = parseInt(hRes.headers.get("content-length") || "0", 10);
-            cacheSet(sizeCache, url, { time: Date.now(), size });
-            return size;
+            const contentLength = hRes.headers.get("content-length");
+            if (contentLength) {
+                const size = parseInt(contentLength, 10);
+                cacheSet(sizeCache, url, { time: Date.now(), size });
+                return size;
+            }
+            throw new Error("No Content-Length");
         } catch {
-            return 0;
+            // 第二优先级：GET + Range请求，从Content-Range获取总大小
+            try {
+                const rRes = await quickFetch(url, {
+                    method: "GET",
+                    headers: { "Range": "bytes=0-0" }
+                }, CONFIG.HEAD_TIMEOUT);
+                const contentRange = rRes.headers.get("content-range");
+                if (contentRange) {
+                    const match = contentRange.match(/\/(\d+)$/);
+                    if (match) {
+                        const size = parseInt(match[1], 10);
+                        cacheSet(sizeCache, url, { time: Date.now(), size });
+                        return size;
+                    }
+                }
+                return 0;
+            } catch {
+                return 0;
+            }
         } finally {
             sizePending.delete(url);
         }
@@ -180,21 +196,11 @@ async function getFileSizeInternal(url) {
 }
 
 async function getFileSize(url) {
-    try {
-        let size = await getFileSizeInternal(url);
-        if (size > 0) return size;
-        throw new Error("Force Retry");
-    } catch {
-        try {
-            await new Promise(r => setTimeout(r, 500));
-            return await getFileSizeInternal(url);
-        } catch {
-            return 0;
-        }
-    }
+    // 移除二次HEAD重试，失败直接走Range兜底，再失败返回0
+    return await getFileSizeInternal(url);
 }
 
-// 批量回填size（带并发限制）
+// 批量回填size（仅画质列表全量探测时使用）
 async function fillVariantsSize(variants) {
     const tasks = variants.map(v => () => getFileSize(v.url));
     const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
@@ -203,14 +209,14 @@ async function fillVariantsSize(variants) {
 }
 
 // ======================
-// URL 规范化：仅去空格，保留完整query参数
+// URL 规范化
 // ======================
 function normalizeVideoUrl(url) {
     return url.trim();
 }
 
 // ======================
-// 去重：宽高+码率联合去重，保留高码率版本
+// 去重：宽高+码率联合去重
 // ======================
 function dedupeVariants(list) {
     const map = new Map();
@@ -228,7 +234,7 @@ function dedupeVariants(list) {
 }
 
 // ======================
-// 排序规则：仅按分辨率→码率降序（移除无意义的size排序）
+// 排序规则：分辨率(高度优先) → 码率降序
 // ======================
 function compareVariant(a, b) {
     if (a.score !== b.score) return b.score - a.score;
@@ -254,7 +260,8 @@ function parseVideoVariant(v, idx = 0) {
         }
     }
 
-    const score = Math.max(width, height);
+    // 优化：以高度为画质基准，更符合视频实际清晰度，AUTO_MIN_HEIGHT逻辑更准确
+    const score = height;
     const label = width && height ? `${width}×${height}` : `未知画质 ${idx + 1}`;
     const type = v.content_type || v.container || "video/mp4";
     const isHLS = type.includes("mpegURL") || type.includes("m3u8");
@@ -273,18 +280,16 @@ function parseVideoVariant(v, idx = 0) {
 }
 
 // ======================
-// 递归收集视频条目（优化：WeakSet防重复遍历+防循环引用，移除冗余字段判断）
+// 递归收集视频条目（WeakSet防重复+防循环引用）
 // ======================
 function walkMedia(obj, collector, visited) {
     if (!obj) return;
 
-    // 对象级去重，避免重复遍历同一对象，防止循环引用死递归
     if (typeof obj === 'object') {
         if (visited.has(obj)) return;
         visited.add(obj);
     }
 
-    // 数组直接递归每个元素
     if (Array.isArray(obj)) {
         obj.forEach(item => walkMedia(item, collector, visited));
         return;
@@ -292,20 +297,18 @@ function walkMedia(obj, collector, visited) {
 
     if (typeof obj !== "object") return;
 
-    // 收集所有已知视频列表字段
     if (Array.isArray(obj.variants)) collector.push(...obj.variants);
     if (Array.isArray(obj.formats)) collector.push(...obj.formats);
     if (Array.isArray(obj.videos)) collector.push(...obj.videos);
     if (Array.isArray(obj.all_videos)) collector.push(...obj.all_videos);
 
-    // 递归遍历所有属性值（不再单独判断media/video等，避免重复遍历）
     for (const value of Object.values(obj)) {
         walkMedia(value, collector, visited);
     }
 }
 
 // ======================
-// 收集并过滤有效视频画质（优化：移除冗余URL Map去重，统一交给dedupe处理）
+// 收集并过滤有效视频画质
 // ======================
 function collectVideoVariants(media = {}) {
     const rawItems = [];
@@ -315,8 +318,6 @@ function collectVideoVariants(media = {}) {
     const parsedList = [];
     rawItems.forEach(item => {
         if (!item || !item.url) return;
-
-        // 非视频格式过滤
         if (item.content_type && !item.content_type.includes("video") && !item.content_type.includes("mpegURL")) return;
         if (item.container && item.container !== "mp4" && item.container !== "m3u8") return;
 
@@ -325,10 +326,8 @@ function collectVideoVariants(media = {}) {
         parsedList.push(parsed);
     });
 
-    // 统一去重
     const deduped = dedupeVariants(parsedList);
 
-    // 基础有效性过滤
     return deduped.filter(v => {
         if (v.isHLS) return false;
         if (!v.url.endsWith('.mp4') && !v.url.includes('.mp4?')) return false;
@@ -343,11 +342,11 @@ function collectVideoVariants(media = {}) {
 // 按钮列表精简：>50MB全保留，≤50MB只留最高一档
 // ======================
 function trimVariantsForButton(list) {
-    let hasUnderLimit = false;
+    let foundUnderLimit = false;
     return list.filter(v => {
         if (v.size > CONFIG.BOT_UPLOAD_LIMIT) return true;
-        if (!hasUnderLimit) {
-            hasUnderLimit = true;
+        if (!foundUnderLimit) {
+            foundUnderLimit = true;
             return true;
         }
         return false;
@@ -355,7 +354,7 @@ function trimVariantsForButton(list) {
 }
 
 // ======================
-// 核心发送函数（优化：URL发送失败自动重试一次，再降级上传）
+// 核心发送函数（流式上传优化）
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
@@ -381,7 +380,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             disable_content_type_detection: true
         };
 
-        // 尝试URL直发，失败自动重试一次
+        // URL直发 + 一次重试
         for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
             try {
                 const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
@@ -390,24 +389,17 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
                     body: JSON.stringify(payload)
                 });
                 const json = await res.json();
-                if (json.ok) {
-                    urlSent = true;
-                } else {
-                    throw new Error(json.description || "Direct URL send failed");
-                }
+                if (json.ok) urlSent = true;
+                else throw new Error(json.description || "Direct URL send failed");
             } catch (e) {
-                if (attempt === 0) {
-                    await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
-                } else {
-                    console.log("URL 发送两次均失败，降级为服务器下载上传:", e.message);
-                }
+                if (attempt === 0) await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
+                else console.log("URL 发送失败，降级为流式上传:", e.message);
             }
         }
 
-        // 兜底：下载后上传
+        // 兜底：流式上传，减少内存拷贝
         if (!urlSent) {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
-            const arrayBuffer = await videoRes.arrayBuffer();
             const formData = new FormData();
             formData.append('chat_id', String(chatId));
             formData.append('caption', caption);
@@ -418,12 +410,11 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             formData.append('width', String(variant.width));
             formData.append('height', String(variant.height));
             formData.append('disable_content_type_detection', 'true');
-            const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
-            formData.append('video', videoBlob, 'video.mp4');
+            // 直接使用响应流，避免完整加载到内存，内存占用减半
+            formData.append('video', videoRes.body, 'video.mp4');
             await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
         }
     } else {
-        // 超出50MB：文本直链
         await fetch(`${TELEGRAM_API}/sendMessage`, {
             method: 'POST',
             headers: JSON_HEADERS,
@@ -479,28 +470,23 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 缓存未命中size则批量探测
+                // 未探测过则批量探测
                 const hasSizeFilled = baseVariants.every(v => v.size > 0);
                 if (!hasSizeFilled) {
                     await fillVariantsSize(baseVariants);
                     cacheData.time = Date.now();
                 }
 
-                // 精简按钮列表
                 const buttonVariants = trimVariantsForButton(baseVariants);
 
-                // 优化：建立URL→索引映射，O(1)查找替代O(n)的findIndex
-                const urlIndexMap = new Map();
-                baseVariants.forEach((v, i) => urlIndexMap.set(v.url, i));
-
-                // 生成按钮（仅分辨率+大小）
+                // 优化：按钮直接携带URL，不依赖索引，排序变化也不会错位
                 const keyboard = [];
                 buttonVariants.forEach((v) => {
                     const sizeMB = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
-                    const realIndex = urlIndexMap.get(v.url);
+                    const encodedUrl = encodeURIComponent(v.url);
                     keyboard.push([{
                         text: `${v.label} · ${sizeMB}`,
-                        callback_data: `send_q:${tweetId}:${realIndex}`
+                        callback_data: `send_q:${tweetId}:${encodedUrl}`
                     }]);
                 });
 
@@ -524,23 +510,25 @@ export default async function handler(req, res) {
             }
         }
 
-        // 指定画质发送
+        // 指定画质发送（优化：只探测当前点击的档位，不全部探测）
         if (callbackData.startsWith('send_q:')) {
-            const [, tweetId, indexStr] = callbackData.split(':');
-            const targetIdx = parseInt(indexStr, 10);
+            const [, tweetId, encodedUrl] = callbackData.split(':');
+            const targetUrl = decodeURIComponent(encodedUrl);
 
             try {
                 const cacheData = await getTweet(tweetId);
                 const { tweet, baseVariants } = cacheData;
                 if (!tweet) return res.status(200).send('OK');
 
-                // 确保size已填充
-                if (baseVariants[targetIdx]?.size === 0) {
-                    await fillVariantsSize(baseVariants);
-                }
-
-                const chosenVariant = baseVariants[targetIdx];
+                // 按URL定位目标档位
+                const chosenVariant = baseVariants.find(v => v.url === targetUrl);
                 if (!chosenVariant) return res.status(200).send('OK');
+
+                // 只探测当前档位的大小，不浪费请求
+                if (chosenVariant.size === 0) {
+                    chosenVariant.size = await getFileSize(chosenVariant.url);
+                    cacheData.time = Date.now();
+                }
 
                 const isOverSize = chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
                 await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true, isOverSize });
@@ -551,7 +539,7 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
     }
 
-    // ================= 用户消息处理（自动发送）
+    // ================= 用户消息处理（自动发送 + 后台预探测）
     const msg = req.body.message;
     if (!msg || !msg.text) return res.status(200).send('OK');
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
@@ -584,7 +572,7 @@ export default async function handler(req, res) {
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
-            // 逐个探测，找到第一个符合条件的立即停止，不做全量HEAD
+            // 逐个探测，找到第一个符合条件的立即停止
             let best = null;
             for (const variant of baseVariants) {
                 variant.size = await getFileSize(variant.url);
@@ -598,13 +586,23 @@ export default async function handler(req, res) {
                 }
             }
 
-            // 刷新缓存时间，已探测的size后续按钮可复用
+            // 优化：后台异步预探测剩余所有档位，不阻塞发送，后续点按钮秒出
+            (async () => {
+                try {
+                    for (const v of baseVariants) {
+                        if (v.size === 0) {
+                            await getFileSize(v.url);
+                        }
+                    }
+                    cacheData.time = Date.now();
+                } catch {}
+            })();
+
             cacheData.time = Date.now();
 
             if (best) {
                 await sendSpecificVideo(chatId, tweet, best, { autoSelected: true });
             } else {
-                // 全部超限，取最高画质走超限逻辑
                 const topVariant = baseVariants[0];
                 topVariant.size = topVariant.size || await getFileSize(topVariant.url);
                 await sendSpecificVideo(chatId, tweet, topVariant, { isOverSize: true });
