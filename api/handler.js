@@ -550,17 +550,33 @@ export default async function handler(req, res) {
     }
 
     // ---------- 2. 处理用户普通消息 ----------
-    // 兼容私聊消息(message)和频道消息(channel_post)
-const msg = req.body.message || req.body.channel_post;
-if (!msg || !msg.text) return res.status(200).send('OK');
-    // 白名单校验
+    // 1. 兼容性接收
+    const msg = req.body.message || req.body.channel_post;
+    if (!msg || !msg.text) return res.status(200).send('OK');
+
+    // 2. 【关键修改】注释掉或者直接删掉 ALLOWED_USER_ID 的校验
+    // 这样只要机器人被拉进的群，或者私聊它，它都会处理链接
+    /*
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
         return res.status(200).send('OK');
     }
+    */
 
     const text = msg.text.trim();
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
+
+    // 3. 自动删除 (保留你原有的删除逻辑)
+    try {
+        await fetch(`${TELEGRAM_API}/deleteMessage`, {
+            method: 'POST',
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+        });
+    } catch (e) {
+        // 如果删不掉，说明没权限或不是管理员，为了防止阻塞，打印一下即可
+        console.log('无法删除消息，请检查机器人是否为管理员');
+    }
 
     // 自动删除用户触发消息
     try {
