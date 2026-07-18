@@ -351,7 +351,7 @@ function trimVariantsForButton(list) {
 }
 
 // ======================
-// 核心发送函数
+// 核心发送函数（修复：兼容所有环境，保证视频优先发送）
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
@@ -362,7 +362,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 
     const caption = buildCaption(tweet, { variant, isManual, isOverSize });
 
-    // 明确已知超限 → 发直链
+    // 只有明确已知超过50MB，才直接发直链文本
     const knownOverSize = variant.size > 0 && variant.size > CONFIG.BOT_UPLOAD_LIMIT;
     if (knownOverSize || isOverSize) {
         await fetch(`${TELEGRAM_API}/sendMessage`, {
@@ -378,7 +378,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         return;
     }
 
-    // 大小未知 或 ≤50MB → 都先尝试 URL 直发
+    // 大小未知 或 ≤50MB，一律先尝试 URL 直发
     let urlSent = false;
     const payload = {
         chat_id: chatId, 
@@ -393,6 +393,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         disable_content_type_detection: true
     };
 
+    // URL直发 + 一次重试
     for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
         try {
             const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
@@ -401,18 +402,27 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
                 body: JSON.stringify(payload)
             });
             const json = await res.json();
-            if (json.ok) urlSent = true;
-            else throw new Error(json.description || "Direct URL send failed");
+            if (json.ok) {
+                urlSent = true;
+            } else {
+                throw new Error(json.description || "Direct URL send failed");
+            }
         } catch (e) {
-            if (attempt === 0) await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
-            else console.log("URL 发送失败，降级为流式上传:", e.message);
+            if (attempt === 0) {
+                await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
+            } else {
+                console.log("URL 发送失败，降级为本地上传:", e.message);
+            }
         }
     }
 
-    // URL 失败 → 流式上传兜底
+    // URL 失败 → 本地上传兜底（使用 arrayBuffer 兼容所有运行环境）
     if (!urlSent) {
         try {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
+            const arrayBuffer = await videoRes.arrayBuffer();
+            const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
+            
             const formData = new FormData();
             formData.append('chat_id', String(chatId));
             formData.append('caption', caption);
@@ -423,17 +433,28 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             formData.append('width', String(variant.width));
             formData.append('height', String(variant.height));
             formData.append('disable_content_type_detection', 'true');
-            formData.append('video', videoRes.body, 'video.mp4');
-            await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+            formData.append('video', videoBlob, 'video.mp4');
+            
+            const uploadRes = await fetch(`${TELEGRAM_API}/sendVideo`, {
+                method: 'POST',
+                body: formData
+            });
+            const uploadJson = await uploadRes.json();
+            if (uploadJson.ok) {
+                urlSent = true;
+            } else {
+                throw new Error(uploadJson.description || "Upload failed");
+            }
         } catch (e) {
-            // 上传也失败 → 最后兜底发直链文本
-            console.error('上传也失败，发送直链:', e.message);
+            // 上传也失败 → 最后兜底：发带直链的文本
+            console.error('视频发送全部失败，发送直链:', e.message);
+            const failCaption = caption + `\n\n⚠️ 视频发送失败，<a href="${variant.url}">点击此处直接观看</a>`;
             await fetch(`${TELEGRAM_API}/sendMessage`, {
                 method: 'POST',
                 headers: JSON_HEADERS,
                 body: JSON.stringify({ 
                     chat_id: chatId, 
-                    text: caption, 
+                    text: failCaption, 
                     parse_mode: 'HTML', 
                     reply_markup: replyMarkup 
                 })
@@ -561,7 +582,7 @@ export default async function handler(req, res) {
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
-    // 自动删除用户发送的消息，保持界面整洁
+    // 自动删除用户消息
     try {
         await fetch(`${TELEGRAM_API}/deleteMessage`, {
             method: 'POST',
@@ -572,7 +593,7 @@ export default async function handler(req, res) {
         console.error('删除消息权限不足:', e.message);
     }
 
-    // ========== 新增：响应 /start 命令 ==========
+    // /start 命令响应
     if (text === '/start') {
         await fetch(`${TELEGRAM_API}/sendMessage`, {
             method: 'POST',
@@ -618,6 +639,7 @@ export default async function handler(req, res) {
                     bestInCurrentRes = null;
                 }
 
+                // size=0 也纳入候选，绝不跳过
                 if (variant.size === 0 || variant.size <= CONFIG.BOT_UPLOAD_LIMIT) {
                     if (!bestInCurrentRes || variant.size > bestInCurrentRes.size) {
                         bestInCurrentRes = variant;
@@ -629,7 +651,7 @@ export default async function handler(req, res) {
                 best = bestInCurrentRes;
             }
 
-            // 极端保底：所有可探测的都超限，取最高分辨率尝试
+            // 极端保底：所有可探测的都超限，取最高分辨率尝试发送
             if (!best) {
                 best = baseVariants.find(v => v.score >= CONFIG.AUTO_MIN_HEIGHT) || baseVariants[0];
             }
