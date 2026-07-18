@@ -11,11 +11,12 @@ const CONFIG = {
     MIN_DISPLAY_HEIGHT: 480,
     AUTO_MIN_HEIGHT: 720,
     HEAD_TIMEOUT: 1800,
-    DOWNLOAD_TIMEOUT: 20000, // 优化11：下载超时延长到20秒，HEAD保持短超时
+    DOWNLOAD_TIMEOUT: 20000,
     TWEET_CACHE_MS: 5 * 60 * 1000,
     SIZE_CACHE_MS: 10 * 60 * 1000,
     MAX_CACHE: 300,
-    HEAD_CONCURRENCY: 3 // 优化4：HEAD并发限制，避免429/连接阻塞
+    HEAD_CONCURRENCY: 3,
+    URL_SEND_RETRY_DELAY: 200 // URL发送失败重试间隔
 };
 
 // ======================
@@ -39,7 +40,7 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
     }
 }
 
-// 优化4：简单并发控制器，无需第三方库
+// 并发控制器
 async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     const results = [];
     let index = 0;
@@ -52,31 +53,6 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     const workers = Array(Math.min(limit, tasks.length)).fill().map(worker);
     await Promise.all(workers);
     return results;
-}
-
-// 优化7：递归遍历对象，深度收集所有视频字段，兼容FXTwitter各种返回结构
-function walkMedia(obj, collector) {
-    if (!obj || typeof obj !== 'object') return;
-    if (Array.isArray(obj)) {
-        obj.forEach(item => walkMedia(item, collector));
-        return;
-    }
-
-    // 命中视频变体字段直接收集
-    if (Array.isArray(obj.variants)) collector.push(...obj.variants);
-    if (Array.isArray(obj.formats)) collector.push(...obj.formats);
-    if (Array.isArray(obj.videos)) collector.push(...obj.videos);
-    if (Array.isArray(obj.all_videos)) collector.push(...obj.all_videos);
-
-    // 嵌套视频对象继续递归
-    if (obj.video) walkMedia(obj.video, collector);
-    if (obj.video_info) walkMedia(obj.video_info, collector);
-    if (obj.media) walkMedia(obj.media, collector);
-
-    // 其他字段继续深度遍历
-    Object.values(obj).forEach(val => {
-        if (val && typeof val === 'object') walkMedia(val, collector);
-    });
 }
 
 // 统一Caption生成
@@ -122,48 +98,85 @@ function cacheSet(cache, key, value) {
 }
 
 // ======================
-// Tweet 缓存（优化9：合并存储tweet+解析后的variants+size，避免重复探测）
+// Tweet 缓存（优化：Promise级去重，并发请求只发一次）
 // ======================
 const tweetCache = new Map();
+const tweetPending = new Map(); // 正在进行中的请求Promise
+
 async function getTweet(tweetId) {
+    // 命中已完成缓存
     const cached = tweetCache.get(tweetId);
     if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
         return cached;
     }
-    const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`);
-    if (!fxRes.ok) throw new Error("解析失败");
-    const json = await fxRes.json();
 
-    // 提前解析好基础variants（不带size），缓存起来复用
-    const rawVariants = collectVideoVariants(json.tweet.media);
-    const baseVariants = dedupeVariants(rawVariants).sort(compareVariant);
+    // 命中进行中的请求，直接复用Promise
+    if (tweetPending.has(tweetId)) {
+        return tweetPending.get(tweetId);
+    }
 
-    const cacheData = {
-        time: Date.now(),
-        tweet: json.tweet,
-        baseVariants // 基础变体列表，size后续探测后回填
-    };
-    cacheSet(tweetCache, tweetId, cacheData);
-    return cacheData;
+    // 发起新请求，缓存Promise
+    const requestPromise = (async () => {
+        try {
+            const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`);
+            if (!fxRes.ok) throw new Error("解析失败");
+            const json = await fxRes.json();
+
+            // 解析并预排序变体列表
+            const rawVariants = collectVideoVariants(json.tweet.media);
+            const baseVariants = dedupeVariants(rawVariants);
+            baseVariants.sort(compareVariant); // 仅排序一次，缓存后复用
+
+            const cacheData = {
+                time: Date.now(),
+                tweet: json.tweet,
+                baseVariants
+            };
+            cacheSet(tweetCache, tweetId, cacheData);
+            return cacheData;
+        } finally {
+            tweetPending.delete(tweetId);
+        }
+    })();
+
+    tweetPending.set(tweetId, requestPromise);
+    return requestPromise;
 }
 
 // ======================
-// 文件大小缓存
+// 文件大小缓存（优化：Promise级去重，同一URL并发只发一次HEAD）
 // ======================
 const sizeCache = new Map();
+const sizePending = new Map(); // 正在进行中的HEAD请求Promise
+
 async function getFileSizeInternal(url) {
+    // 命中已完成缓存
     const cached = sizeCache.get(url);
     if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
         return cached.size;
     }
-    try {
-        const hRes = await quickFetch(url, { method: "HEAD" }, CONFIG.HEAD_TIMEOUT);
-        const size = parseInt(hRes.headers.get("content-length") || "0", 10);
-        cacheSet(sizeCache, url, { time: Date.now(), size });
-        return size;
-    } catch {
-        return 0;
+
+    // 命中进行中的请求，直接复用Promise
+    if (sizePending.has(url)) {
+        return sizePending.get(url);
     }
+
+    // 发起新HEAD请求，缓存Promise
+    const requestPromise = (async () => {
+        try {
+            const hRes = await quickFetch(url, { method: "HEAD" }, CONFIG.HEAD_TIMEOUT);
+            const size = parseInt(hRes.headers.get("content-length") || "0", 10);
+            cacheSet(sizeCache, url, { time: Date.now(), size });
+            return size;
+        } catch {
+            return 0;
+        } finally {
+            sizePending.delete(url);
+        }
+    })();
+
+    sizePending.set(url, requestPromise);
+    return requestPromise;
 }
 
 async function getFileSize(url) {
@@ -181,7 +194,7 @@ async function getFileSize(url) {
     }
 }
 
-// 批量回填size到variants（带并发限制）
+// 批量回填size（带并发限制）
 async function fillVariantsSize(variants) {
     const tasks = variants.map(v => () => getFileSize(v.url));
     const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
@@ -190,36 +203,36 @@ async function fillVariantsSize(variants) {
 }
 
 // ======================
-// URL 去重（优化8：不再删除query参数，避免带token的CDN链接失效）
+// URL 规范化：仅去空格，保留完整query参数
 // ======================
 function normalizeVideoUrl(url) {
-    return url.trim(); // 仅去空格，保留完整query参数
+    return url.trim();
 }
 
 // ======================
-// 优化6：同分辨率+同码率去重，避免同规格多URL重复
+// 去重：宽高+码率联合去重，保留高码率版本
 // ======================
 function dedupeVariants(list) {
     const map = new Map();
     for (const v of list) {
-        const key = `${v.width}x${v.height}_${v.bitrate}`; // 宽高+码率联合去重
+        const key = `${v.width}x${v.height}_${v.bitrate}`;
         if (!map.has(key)) {
             map.set(key, v);
             continue;
         }
-        const old = map.get(key);
-        if (v.bitrate > old.bitrate) map.set(key, v);
+        if (v.bitrate > map.get(key).bitrate) {
+            map.set(key, v);
+        }
     }
     return [...map.values()];
 }
 
 // ======================
-// 统一排序规则（从高到低）
+// 排序规则：仅按分辨率→码率降序（移除无意义的size排序）
 // ======================
 function compareVariant(a, b) {
     if (a.score !== b.score) return b.score - a.score;
     if (a.bitrate !== b.bitrate) return b.bitrate - a.bitrate;
-    if ((b.size || 0) !== (a.size || 0)) return (a.size || 0) - (b.size || 0);
     return 0;
 }
 
@@ -260,29 +273,65 @@ function parseVideoVariant(v, idx = 0) {
 }
 
 // ======================
-// 收集视频画质（递归增强版）
+// 递归收集视频条目（优化：WeakSet防重复遍历+防循环引用，移除冗余字段判断）
+// ======================
+function walkMedia(obj, collector, visited) {
+    if (!obj) return;
+
+    // 对象级去重，避免重复遍历同一对象，防止循环引用死递归
+    if (typeof obj === 'object') {
+        if (visited.has(obj)) return;
+        visited.add(obj);
+    }
+
+    // 数组直接递归每个元素
+    if (Array.isArray(obj)) {
+        obj.forEach(item => walkMedia(item, collector, visited));
+        return;
+    }
+
+    if (typeof obj !== "object") return;
+
+    // 收集所有已知视频列表字段
+    if (Array.isArray(obj.variants)) collector.push(...obj.variants);
+    if (Array.isArray(obj.formats)) collector.push(...obj.formats);
+    if (Array.isArray(obj.videos)) collector.push(...obj.videos);
+    if (Array.isArray(obj.all_videos)) collector.push(...obj.all_videos);
+
+    // 递归遍历所有属性值（不再单独判断media/video等，避免重复遍历）
+    for (const value of Object.values(obj)) {
+        walkMedia(value, collector, visited);
+    }
+}
+
+// ======================
+// 收集并过滤有效视频画质（优化：移除冗余URL Map去重，统一交给dedupe处理）
 // ======================
 function collectVideoVariants(media = {}) {
     const rawItems = [];
-    walkMedia(media, rawItems); // 递归收集所有可能的视频条目
+    const visited = new WeakSet();
+    walkMedia(media, rawItems, visited);
 
-    const map = new Map();
+    const parsedList = [];
     rawItems.forEach(item => {
         if (!item || !item.url) return;
-        
-        // 过滤非视频格式
+
+        // 非视频格式过滤
         if (item.content_type && !item.content_type.includes("video") && !item.content_type.includes("mpegURL")) return;
         if (item.container && item.container !== "mp4" && item.container !== "m3u8") return;
 
         const parsed = parseVideoVariant(item);
         parsed.bitrate = item.bitrate || parsed.bitrate || 0;
-        if (!map.has(parsed.url)) map.set(parsed.url, parsed);
+        parsedList.push(parsed);
     });
 
-    // 基础过滤
-    return [...map.values()].filter(v => {
+    // 统一去重
+    const deduped = dedupeVariants(parsedList);
+
+    // 基础有效性过滤
+    return deduped.filter(v => {
         if (v.isHLS) return false;
-        if (!v.url.endsWith('.mp4') && !v.url.includes('.mp4?')) return false; // 兼容带query的mp4
+        if (!v.url.endsWith('.mp4') && !v.url.includes('.mp4?')) return false;
         if (v.width <= 0 || v.height <= 0) return false;
         if (v.width > 7680 || v.height > 7680) return false;
         if (v.score < CONFIG.MIN_DISPLAY_HEIGHT) return false;
@@ -306,7 +355,7 @@ function trimVariantsForButton(list) {
 }
 
 // ======================
-// 核心发送函数
+// 核心发送函数（优化：URL发送失败自动重试一次，再降级上传）
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
@@ -319,30 +368,40 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 
     if (variant.size > 0 && variant.size <= CONFIG.BOT_UPLOAD_LIMIT) {
         let urlSent = false;
-        
-        // 优先URL直发
-        try {
-            const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
-                method: 'POST',
-                headers: JSON_HEADERS,
-                body: JSON.stringify({
-                    chat_id: chatId, 
-                    video: variant.url, 
-                    caption, 
-                    parse_mode: 'HTML',
-                    show_caption_above_media: true, 
-                    reply_markup: replyMarkup,
-                    supports_streaming: true,
-                    width: variant.width,
-                    height: variant.height,
-                    disable_content_type_detection: true // 优化10：减少URL发送失败率
-                })
-            });
-            const json = await res.json();
-            if (json.ok) urlSent = true;
-            else throw new Error("Direct URL fallback triggered");
-        } catch (e) {
-            console.log("URL 发送失败，降级为服务器下载上传:", e.message);
+        const payload = {
+            chat_id: chatId, 
+            video: variant.url, 
+            caption, 
+            parse_mode: 'HTML',
+            show_caption_above_media: true, 
+            reply_markup: replyMarkup,
+            supports_streaming: true,
+            width: variant.width,
+            height: variant.height,
+            disable_content_type_detection: true
+        };
+
+        // 尝试URL直发，失败自动重试一次
+        for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
+            try {
+                const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
+                    method: 'POST',
+                    headers: JSON_HEADERS,
+                    body: JSON.stringify(payload)
+                });
+                const json = await res.json();
+                if (json.ok) {
+                    urlSent = true;
+                } else {
+                    throw new Error(json.description || "Direct URL send failed");
+                }
+            } catch (e) {
+                if (attempt === 0) {
+                    await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
+                } else {
+                    console.log("URL 发送两次均失败，降级为服务器下载上传:", e.message);
+                }
+            }
         }
 
         // 兜底：下载后上传
@@ -420,22 +479,25 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 缓存命中size则直接用，否则批量探测
+                // 缓存未命中size则批量探测
                 const hasSizeFilled = baseVariants.every(v => v.size > 0);
                 if (!hasSizeFilled) {
                     await fillVariantsSize(baseVariants);
-                    baseVariants.sort(compareVariant);
-                    cacheData.time = Date.now(); // 刷新缓存时间
+                    cacheData.time = Date.now();
                 }
 
                 // 精简按钮列表
                 const buttonVariants = trimVariantsForButton(baseVariants);
 
-                // 生成按钮（只显示分辨率+大小）
+                // 优化：建立URL→索引映射，O(1)查找替代O(n)的findIndex
+                const urlIndexMap = new Map();
+                baseVariants.forEach((v, i) => urlIndexMap.set(v.url, i));
+
+                // 生成按钮（仅分辨率+大小）
                 const keyboard = [];
                 buttonVariants.forEach((v) => {
                     const sizeMB = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
-                    const realIndex = baseVariants.findIndex(item => item.url === v.url);
+                    const realIndex = urlIndexMap.get(v.url);
                     keyboard.push([{
                         text: `${v.label} · ${sizeMB}`,
                         callback_data: `send_q:${tweetId}:${realIndex}`
@@ -475,7 +537,6 @@ export default async function handler(req, res) {
                 // 确保size已填充
                 if (baseVariants[targetIdx]?.size === 0) {
                     await fillVariantsSize(baseVariants);
-                    baseVariants.sort(compareVariant);
                 }
 
                 const chosenVariant = baseVariants[targetIdx];
@@ -523,7 +584,7 @@ export default async function handler(req, res) {
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
-            // 优化1：自动发送逐个探测，找到第一个符合条件的立即停止，不用全量HEAD
+            // 逐个探测，找到第一个符合条件的立即停止，不做全量HEAD
             let best = null;
             for (const variant of baseVariants) {
                 variant.size = await getFileSize(variant.url);
@@ -537,7 +598,7 @@ export default async function handler(req, res) {
                 }
             }
 
-            // 回填已探测的size到缓存，后续按钮直接复用
+            // 刷新缓存时间，已探测的size后续按钮可复用
             cacheData.time = Date.now();
 
             if (best) {
