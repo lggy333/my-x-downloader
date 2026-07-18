@@ -550,8 +550,9 @@ export default async function handler(req, res) {
     }
 
     // ---------- 2. 处理用户普通消息 ----------
-    const msg = req.body.message;
-    if (!msg || !msg.text) return res.status(200).send('OK');
+    // 兼容私聊消息(message)和频道消息(channel_post)
+const msg = req.body.message || req.body.channel_post;
+if (!msg || !msg.text) return res.status(200).send('OK');
     // 白名单校验
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
         return res.status(200).send('OK');
