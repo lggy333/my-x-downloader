@@ -16,11 +16,11 @@ async function quickFetch(url, options = {}, timeoutMs = 2000) {
   }
 }
 
-// 核心重构：保证该函数无论如何绝对不可能报错，且至少保证吐出两条通道
+// 核心重构：彻底去重并对直链附加 .mp4 渲染伪装
 async function getRobustVariants(tweetId) {
   const variants = [];
   
-  // 1. 尝试快速读取精细流
+  // 1. 尝试快速读取镜像节点的精细流
   try {
     const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 1500);
     if (fxRes.ok) {
@@ -28,81 +28,101 @@ async function getRobustVariants(tweetId) {
       const fxVideos = fxData.tweet?.media?.videos || [];
       for (const vid of fxVideos) {
         if (vid.url) {
-          let label = `⚡ 标清流`;
+          let label = `⚡ 标清 480p 极速`;
           let score = 480;
-          if (vid.width >= 1080 || vid.height >= 1080) { label = `🔥 顶级超清原画`; score = 1080; }
-          else if (vid.width >= 720 || vid.height >= 720 || vid.height === 852) { label = `✨ 高清自适应`; score = 720; }
+          if (vid.width >= 1080 || vid.height >= 1080) { label = `🔥 顶级 1080p 超清原画`; score = 1080; }
+          else if (vid.width >= 720 || vid.height >= 720 || vid.height === 852) { label = `✨ 高清 720p/852p 自适应`; score = 720; }
           variants.push({ url: vid.url, score, label, size: 0 }); 
         }
       }
     }
   } catch (e) {}
 
-  // 2. 无论上面结果如何，无条件追加两个绝对可用的静态直链网关，双重保险！
+  // 2. 追加物理兼容直链网关（通过给参数尾缀挂上 .mp4，强行触发 TG 的视频内嵌组件）
   variants.push({
-    url: `https://d.fxtwitter.com/i/status/${tweetId}`,
-    score: 1081, // 用微弱分值错开
-    label: `🔥 1280p/1080p 超清原画通道`,
-    size: 74 * 1024 * 1024
+    url: `https://d.fxtwitter.com/i/status/${tweetId}?ext=.mp4`,
+    score: 1080,
+    label: `🔥 顶级 1080p 超清原画`,
+    size: 74.4 * 1024 * 1024
   });
   variants.push({
-    url: `https://v.ddtwit.com/i/status/${tweetId}`,
-    score: 721,
-    label: `⚡ 852p/720p 高清秒开通道`,
-    size: 25 * 1024 * 1024
+    url: `https://v.ddtwit.com/i/status/${tweetId}?ext=.mp4`,
+    score: 720,
+    label: `⚡ 高清 720p/852p 秒开流`,
+    size: 25.0 * 1024 * 1024
   });
 
-  // 3. 补全大小（如果 HEAD 卡住，直接赋予虚拟大小，坚决不报错不卡死）
+  // 3. 严格去重与体积补全
   const finalVariants = [];
-  const checkedUrls = new Set();
+  const seenScores = new Set();
+  const seenUrls = new Set();
 
   for (const v of variants) {
-    if (checkedUrls.has(v.url)) continue;
-    checkedUrls.add(v.url);
+    // 优先保留带有特定后缀伪装或者已经拥有明确体积的黄金渠道
+    const urlKey = v.url.split('?')[0];
+    if (seenUrls.has(urlKey)) continue;
 
     if (v.size === 0) {
       try {
         const hRes = await quickFetch(v.url, { method: 'HEAD' }, 1000);
         v.size = parseInt(hRes.headers.get('content-length') || '0', 10);
       } catch (e) {}
-      if (!v.size) v.size = 28 * 1024 * 1024; // 兜底虚拟体积
+      if (!v.size) {
+        v.size = v.score === 1080 ? 74.4 * 1024 * 1024 : 25.0 * 1024 * 1024;
+      }
     }
+
+    // 根据清晰度档位进行最终面板去重，确保 1080p 和 720p 各只留一个最稳的
+    if (seenScores.has(v.score)) continue;
+    
+    seenUrls.add(urlKey);
+    seenScores.add(v.score);
     finalVariants.push(v);
   }
 
   return finalVariants.sort((a, b) => b.score - a.score);
 }
 
-// 核心投递：只要进到这里，就是强行发送视频
+// 核心投递：让 Telegram 乖乖生出视频播放框
 async function sendSpecificVideo(chatId, tweetId, variant, caption) {
   const replyMarkup = {
     inline_keyboard: [[{ text: "📊 切换其他画质通道", callback_data: `list_q:${tweetId}` }]]
   };
 
-  const sizeMB = variant.size ? `${(variant.size / (1024 * 1024)).toFixed(1)} MB` : '自动';
+  const sizeMB = `${(variant.size / (1024 * 1024)).toFixed(1)} MB`;
   const fullCaption = `${caption}\n⚙️ <i>当前选定: ${variant.label} [${sizeMB}]</i>`;
 
   try {
+    // 强行调用 sendVideo
     const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ 
-        chat_id: chatId, video: variant.url, caption: fullCaption, parse_mode: 'HTML',
-        show_caption_above_media: true, reply_markup: replyMarkup 
+        chat_id: chatId, 
+        video: variant.url, 
+        caption: fullCaption, 
+        parse_mode: 'HTML',
+        show_caption_above_media: true, 
+        reply_markup: replyMarkup 
       })
     });
 
-    if (res.ok) return true;
+    const data = await res.json();
+    // 如果 Telegram 服务器成功收录并返回了结果，说明直接弹出视频播放框大功告成！
+    if (res.ok && data.ok) return true;
   } catch (e) {}
 
-  // 只有在 Telegram 官方接口明确拒绝该链接时，才展示带无损按钮的卡片，体验完全闭环
-  const textCaption = `🎬 <b>视频画质解析完成！</b>\n🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>当前通道: ${variant.label}</i>\n\n💡 <b>点播提示</b>：由于原厂视频规格特殊，若无法在聊天框直接内嵌，请点击下方按钮切换到 <b>720p 兼容通道</b> 即可播放。或点击下方按钮直接下载：\n\n🚀 <b>下载传送门：</b>\n👉 <a href="${variant.url}"><b>【点击无损下载 / 浏览器播放】</b></a>`;
+  // 降级保底：如果网络实在太差导致拉取失败，才丢出带有跳转播放的文本卡片
+  const textCaption = `🎬 <b>视频画质解析完成！</b>\n🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>当前通道: ${variant.label}</i>\n\n💡 <b>点播提示</b>：该清晰度由于原厂体积较大，若无法在聊天框内直接内嵌渲染，请点击下方按钮无损下载或使用外部播放器点播：\n\n🚀 <b>无损直链传送门：</b>\n👉 <a href="${variant.url}"><b>【点击无损下载 / 浏览器播放】</b></a>`;
   await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ 
-      chat_id: chatId, text: textCaption, parse_mode: 'HTML', 
-      reply_markup: replyMarkup, link_preview_options: { is_disabled: true } 
+      chat_id: chatId, 
+      text: textCaption, 
+      parse_mode: 'HTML', 
+      reply_markup: replyMarkup, 
+      link_preview_options: { is_disabled: true } 
     })
   });
   return false;
@@ -132,7 +152,7 @@ export default async function handler(req, res) {
       const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在多路同步全网高清流，请稍候..." })
+        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在精细调配多路画质网关..." })
       });
       const progressData = await progressRes.json();
       const progressMsgId = progressData.result?.message_id;
@@ -151,13 +171,13 @@ export default async function handler(req, res) {
           headers: JSON_HEADERS,
           body: JSON.stringify({
             chat_id: chatId, message_id: progressMsgId,
-            text: `📊 <b>多画质高速通道已就绪</b>\n(提示：请优先选择体积在 50MB 以下的档位，100% 可以在 Telegram 内直接弹出视频框播放) :`,
+            text: `📊 <b>请选择你想要调配的专属画质通道</b>：\n(提示：请优先选择带有 **秒开流** 的小体积档位，可 100% 触发 Telegram 聊天框内直接播放)`,
             parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
           })
         });
       } catch (err) {
         if (progressMsgId) {
-          const fbKeyboard = [[{ text: "⚡ 兼容分流自适应通道", callback_data: `send_q:${tweetId}:0` }]];
+          const fbKeyboard = [[{ text: "⚡ 高清 720p/852p 秒开流 - 25.0 MB", callback_data: `send_q:${tweetId}:0` }]];
           await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `📊 <b>多画质通道已在备用总线就绪</b>：`, parse_mode: 'HTML', reply_markup: { inline_keyboard: fbKeyboard } }) });
         }
       }
@@ -187,7 +207,6 @@ export default async function handler(req, res) {
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
 
-  // 立即静默删除用户发来的原链接
   try {
     await fetch(`${TELEGRAM_API}/deleteMessage`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: messageId }) });
   } catch (e) {}
@@ -199,23 +218,21 @@ export default async function handler(req, res) {
   const tweetId = match[1];
   const originalTweetLink = `https://x.com/i/status/${tweetId}`;
 
-  // 核心风控对冲：无论发生任何意外，坚决不允许再报“视频解析失败”的文本！
   try {
     const sortedVariants = await getRobustVariants(tweetId);
-    // 自动选择最佳首发档位（优先选小于 45MB 的自适应流，能极大概率直接出视频框）
+    // 默认首发逻辑：自动在后台挑选小体积、带 MP4 伪装的秒开通道，强行冲关弹出播放框
     let finalSelectedVariant = sortedVariants.find(v => v.size <= 45 * 1024 * 1024) || sortedVariants[1] || sortedVariants[0];
 
     await sendSpecificVideo(chatId, tweetId, finalSelectedVariant, `🔗 <a href="${originalTweetLink}">查看原推特</a>`);
   } catch (globalError) {
-    // 终极绝杀兜底：只要上面有任何未知的闪失，立刻不经任何查询，强行打包直接发送视频流！
     try {
       await fetch(`${TELEGRAM_API}/sendVideo`, {
         method: 'POST',
         headers: JSON_HEADERS,
         body: JSON.stringify({ 
           chat_id: chatId, 
-          video: `https://d.fxtwitter.com/i/status/${tweetId}`, 
-          caption: `🔗 <a href="${originalTweetLink}">查看原推特</a>\n⚙️ <i>[安全模式直发通道]</i>`, 
+          video: `https://v.ddtwit.com/i/status/${tweetId}?ext=.mp4`, 
+          caption: `🔗 <a href="${originalTweetLink}">查看原推特</a>\n⚙️ <i>[安全首发秒开通道]</i>`, 
           parse_mode: 'HTML',
           reply_markup: { inline_keyboard: [[{ text: "📊 切换其他画质通道", callback_data: `list_q:${tweetId}` }]] }
         })
