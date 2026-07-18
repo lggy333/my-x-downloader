@@ -167,7 +167,7 @@ async function getFileSizeInternal(url) {
             }
             throw new Error("No Content-Length");
         } catch {
-            // 第二优先级：GET + Range请求，从Content-Range获取总大小
+            // 第二优先级：GET + Range请求
             try {
                 const rRes = await quickFetch(url, {
                     method: "GET",
@@ -215,13 +215,12 @@ function normalizeVideoUrl(url) {
 }
 
 // ======================
-// 优化：同分辨率只保留最高码率版本，减少冗余档位
+// 去重：同分辨率保留最高码率版本
 // ======================
 function dedupeVariants(list) {
     const map = new Map();
     for (const v of list) {
         const key = `${v.width}x${v.height}`;
-        // 同分辨率下只保留码率最高的版本
         if (!map.has(key) || v.bitrate > map.get(key).bitrate) {
             map.set(key, v);
         }
@@ -230,7 +229,7 @@ function dedupeVariants(list) {
 }
 
 // ======================
-// 排序规则：分辨率(高度优先) → 码率降序
+// 排序规则：分辨率(高度) → 码率 降序
 // ======================
 function compareVariant(a, b) {
     if (a.score !== b.score) return b.score - a.score;
@@ -275,7 +274,7 @@ function parseVideoVariant(v, idx = 0) {
 }
 
 // ======================
-// 递归收集视频条目（WeakSet防重复+防循环引用）
+// 递归收集视频条目
 // ======================
 function walkMedia(obj, collector, visited) {
     if (!obj) return;
@@ -334,11 +333,11 @@ function collectVideoVariants(media = {}) {
 }
 
 // ======================
-// 按钮列表精简：全部有大小时，>50MB全保留，≤50MB只留最高一档
+// 按钮列表精简
 // ======================
 function trimVariantsForButton(list) {
     const allHasSize = list.every(v => v.size > 0);
-    if (!allHasSize) return list; // 未全部探测完则全显示
+    if (!allHasSize) return list;
 
     let foundUnderLimit = false;
     return list.filter(v => {
@@ -352,7 +351,7 @@ function trimVariantsForButton(list) {
 }
 
 // ======================
-// 核心发送函数（流式上传优化）
+// 核心发送函数（修复：size=0 也尝试直发，不直接走超限）
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
@@ -363,40 +362,56 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 
     const caption = buildCaption(tweet, { variant, isManual, isOverSize });
 
-    if (variant.size > 0 && variant.size <= CONFIG.BOT_UPLOAD_LIMIT) {
-        let urlSent = false;
-        const payload = {
-            chat_id: chatId, 
-            video: variant.url, 
-            caption, 
-            parse_mode: 'HTML',
-            show_caption_above_media: true, 
-            reply_markup: replyMarkup,
-            supports_streaming: true,
-            width: variant.width,
-            height: variant.height,
-            disable_content_type_detection: true
-        };
+    // 明确已知超限 → 发直链
+    const knownOverSize = variant.size > 0 && variant.size > CONFIG.BOT_UPLOAD_LIMIT;
+    if (knownOverSize || isOverSize) {
+        await fetch(`${TELEGRAM_API}/sendMessage`, {
+            method: 'POST',
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ 
+                chat_id: chatId, 
+                text: caption, 
+                parse_mode: 'HTML', 
+                reply_markup: replyMarkup 
+            })
+        });
+        return;
+    }
 
-        // URL直发 + 一次重试
-        for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
-            try {
-                const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
-                    method: 'POST',
-                    headers: JSON_HEADERS,
-                    body: JSON.stringify(payload)
-                });
-                const json = await res.json();
-                if (json.ok) urlSent = true;
-                else throw new Error(json.description || "Direct URL send failed");
-            } catch (e) {
-                if (attempt === 0) await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
-                else console.log("URL 发送失败，降级为流式上传:", e.message);
-            }
+    // 大小未知 或 ≤50MB → 都先尝试 URL 直发
+    let urlSent = false;
+    const payload = {
+        chat_id: chatId, 
+        video: variant.url, 
+        caption, 
+        parse_mode: 'HTML',
+        show_caption_above_media: true, 
+        reply_markup: replyMarkup,
+        supports_streaming: true,
+        width: variant.width,
+        height: variant.height,
+        disable_content_type_detection: true
+    };
+
+    for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
+        try {
+            const res = await fetch(`${TELEGRAM_API}/sendVideo`, {
+                method: 'POST',
+                headers: JSON_HEADERS,
+                body: JSON.stringify(payload)
+            });
+            const json = await res.json();
+            if (json.ok) urlSent = true;
+            else throw new Error(json.description || "Direct URL send failed");
+        } catch (e) {
+            if (attempt === 0) await new Promise(r => setTimeout(r, CONFIG.URL_SEND_RETRY_DELAY));
+            else console.log("URL 发送失败，降级为流式上传:", e.message);
         }
+    }
 
-        // 兜底：流式上传，减少内存拷贝
-        if (!urlSent) {
+    // URL 失败 → 流式上传兜底（大小未知也尝试上传，让 Telegram 自己判断）
+    if (!urlSent) {
+        try {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
             const formData = new FormData();
             formData.append('chat_id', String(chatId));
@@ -410,19 +425,20 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             formData.append('disable_content_type_detection', 'true');
             formData.append('video', videoRes.body, 'video.mp4');
             await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+        } catch (e) {
+            // 上传也失败 → 最后兜底发直链文本
+            console.error('上传也失败，发送直链:', e.message);
+            await fetch(`${TELEGRAM_API}/sendMessage`, {
+                method: 'POST',
+                headers: JSON_HEADERS,
+                body: JSON.stringify({ 
+                    chat_id: chatId, 
+                    text: caption, 
+                    parse_mode: 'HTML', 
+                    reply_markup: replyMarkup 
+                })
+            });
         }
-    } else {
-        // 超出50MB：文本直链
-        await fetch(`${TELEGRAM_API}/sendMessage`, {
-            method: 'POST',
-            headers: JSON_HEADERS,
-            body: JSON.stringify({ 
-                chat_id: chatId, 
-                text: caption, 
-                parse_mode: 'HTML', 
-                reply_markup: replyMarkup 
-            })
-        });
     }
 }
 
@@ -445,7 +461,7 @@ export default async function handler(req, res) {
             body: JSON.stringify({ callback_query_id: callback.id })
         }).catch(() => {});
 
-        // 画质列表（优化：不强制全量探测，有缓存显示大小，无缓存仅显示分辨率，秒开）
+        // 画质列表
         if (callbackData.startsWith('list_q:')) {
             const tweetId = callbackData.split(':')[1];
             const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
@@ -468,10 +484,7 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 精简按钮列表
                 const buttonVariants = trimVariantsForButton(baseVariants);
-
-                // 生成按钮：有大小显示大小，无大小仅显示分辨率
                 const keyboard = [];
                 buttonVariants.forEach((v) => {
                     const sizeText = v.size > 0 ? ` · ${(v.size / (1024 * 1024)).toFixed(1)} MB` : '';
@@ -494,7 +507,7 @@ export default async function handler(req, res) {
                     })
                 });
 
-                // 后台静默预探测剩余大小，不阻塞返回
+                // 后台静默预探测
                 (async () => {
                     try {
                         await fillVariantsSize(baseVariants);
@@ -510,7 +523,7 @@ export default async function handler(req, res) {
             }
         }
 
-        // 指定画质发送（仅探测当前选中的档位）
+        // 指定画质发送
         if (callbackData.startsWith('send_q:')) {
             const [, tweetId, encodedUrl] = callbackData.split(':');
             const targetUrl = decodeURIComponent(encodedUrl);
@@ -523,13 +536,12 @@ export default async function handler(req, res) {
                 const chosenVariant = baseVariants.find(v => v.url === targetUrl);
                 if (!chosenVariant) return res.status(200).send('OK');
 
-                // 仅探测当前档位大小
                 if (chosenVariant.size === 0) {
                     chosenVariant.size = await getFileSize(chosenVariant.url);
                     cacheData.time = Date.now();
                 }
 
-                const isOverSize = chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
+                const isOverSize = chosenVariant.size > 0 && chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
                 await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true, isOverSize });
             } catch (e) {
                 console.error('手动投递失败', e.message);
@@ -538,7 +550,7 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
     }
 
-    // ================= 用户消息处理（自动选档：50MB内选最大体积）
+    // ================= 用户消息处理（修正自动选档逻辑）
     const msg = req.body.message;
     if (!msg || !msg.text) return res.status(200).send('OK');
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
@@ -571,29 +583,52 @@ export default async function handler(req, res) {
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
-            // 核心优化：遍历所有档位，记录50MB以内体积最大的最优解
+            // ========== 修正后的自动选档逻辑 ==========
+            // 原则：分辨率优先 → 同分辨率选体积最大 → size=0 不跳过，保底直接发最高分辨率
             let best = null;
+            let currentRes = -1;
+            let bestInCurrentRes = null;
+
             for (const variant of baseVariants) {
+                // 低于最低分辨率要求直接跳过
+                if (variant.score < CONFIG.AUTO_MIN_HEIGHT) continue;
+
                 variant.size = await getFileSize(variant.url);
-                if (
-                    variant.size > 0 &&
-                    variant.size <= CONFIG.BOT_UPLOAD_LIMIT &&
-                    variant.score >= CONFIG.AUTO_MIN_HEIGHT
-                ) {
-                    // 始终选择体积更大的版本，充分利用50MB上限
-                    if (!best || variant.size > best.size) {
-                        best = variant;
+
+                // 进入下一个分辨率档位
+                if (variant.score !== currentRes) {
+                    // 上一个分辨率档位有符合条件的，直接选（分辨率优先）
+                    if (bestInCurrentRes) {
+                        best = bestInCurrentRes;
+                        break;
+                    }
+                    currentRes = variant.score;
+                    bestInCurrentRes = null;
+                }
+
+                // 同分辨率下，记录体积最大且不超限的版本
+                if (variant.size === 0 || variant.size <= CONFIG.BOT_UPLOAD_LIMIT) {
+                    if (!bestInCurrentRes || variant.size > bestInCurrentRes.size) {
+                        bestInCurrentRes = variant;
                     }
                 }
             }
 
-            // 后台异步预探测剩余所有档位大小，不阻塞发送
+            // 遍历完还没找到，检查最后一个分辨率档位
+            if (!best && bestInCurrentRes) {
+                best = bestInCurrentRes;
+            }
+
+            // 极端情况：所有能探测大小的都超限 → 取最高分辨率保底直发
+            if (!best) {
+                best = baseVariants.find(v => v.score >= CONFIG.AUTO_MIN_HEIGHT) || baseVariants[0];
+            }
+
+            // 后台异步预探测剩余档位
             (async () => {
                 try {
                     for (const v of baseVariants) {
-                        if (v.size === 0) {
-                            await getFileSize(v.url);
-                        }
+                        if (v.size === 0) await getFileSize(v.url);
                     }
                     cacheData.time = Date.now();
                 } catch {}
@@ -601,14 +636,8 @@ export default async function handler(req, res) {
 
             cacheData.time = Date.now();
 
-            if (best) {
-                await sendSpecificVideo(chatId, tweet, best, { autoSelected: true });
-            } else {
-                // 全部超限，取最高画质走超限逻辑
-                const topVariant = baseVariants[0];
-                topVariant.size = topVariant.size || await getFileSize(topVariant.url);
-                await sendSpecificVideo(chatId, tweet, topVariant, { isOverSize: true });
-            }
+            const isOverSize = best.size > 0 && best.size > CONFIG.BOT_UPLOAD_LIMIT;
+            await sendSpecificVideo(chatId, tweet, best, { autoSelected: true, isOverSize });
 
         } else if (photos.length > 0) {
             const replyMarkup = { inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]] };
