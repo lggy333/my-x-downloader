@@ -33,7 +33,20 @@ export default async function handler(req, res) {
 
   const text = msg.text;
   const chatId = msg.chat.id;
+  const messageId = msg.message_id;
 
+  // 【核心新增】只要你发了消息，不管是不是 X 链接，立刻无条件尝试删除原消息
+  try {
+    await fetch(`${TELEGRAM_API}/deleteMessage`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+    });
+  } catch (e) {
+    console.error('删除原消息失败:', e.message);
+  }
+
+  // 之后再进行正则匹配，如果不是 X 链接，代码到这里就静默结束（原消息已被删）
   const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
   const match = text.match(twitterRegex);
   if (!match) return res.status(200).send('OK'); 
@@ -50,7 +63,6 @@ export default async function handler(req, res) {
     if (!tweet) return res.status(200).send('OK');
 
     const safeText = escapeHTML(tweet.text);
-    // 【优化】全部切回旧版 twitter.com 域名，利用 TG 客户端的白名单机制减少/免去弹窗警告
     const authorLink = `https://twitter.com/${tweet.author.screen_name}`;
     const originalTweetLink = `https://twitter.com/i/status/${tweetId}`;
     
@@ -75,7 +87,6 @@ export default async function handler(req, res) {
       const MAX_BOT_SIZE = 50 * 1024 * 1024; 
 
       if (contentLength > 0 && contentLength <= MAX_URL_SIZE) {
-        // 【优化】加入 show_caption_above_media: true 让文字强行置顶
         await fetch(`${TELEGRAM_API}/sendVideo`, {
           method: 'POST',
           headers: JSON_HEADERS,
@@ -95,7 +106,6 @@ export default async function handler(req, res) {
         formData.append('chat_id', String(chatId));
         formData.append('caption', caption);
         formData.append('parse_mode', 'HTML');
-        // 【优化】FormData 模式下同样注入置顶参数
         formData.append('show_caption_above_media', 'true');
         
         const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
@@ -103,7 +113,6 @@ export default async function handler(req, res) {
 
         await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
       } else {
-        // 超大视频文本逻辑
         const sizeInMB = contentLength > 0 ? (contentLength / (1024 * 1024)).toFixed(1) : '未知';
         const overSizeCaption = `📝 ${safeText}\n\n👤 作者: <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a>\n\n⚠️ 提示：视频过大 (${sizeInMB}MB) 无法直接保存\n🚀 <a href="${videoUrl}">点此下载高清原片</a> | <a href="${originalTweetLink}">查看原推特</a>`;
         
