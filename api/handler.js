@@ -8,7 +8,7 @@ function escapeHTML(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function quickFetch(url, options = {}, timeoutMs = 4000) {
+async function quickFetch(url, options = {}, timeoutMs = 3500) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -21,70 +21,95 @@ async function quickFetch(url, options = {}, timeoutMs = 4000) {
   }
 }
 
-// 突破核心：利用 TwitSave 搬运网关，极速套出真正分级的有声 MP4 直链
-async function fetchMultiQualities(tweetId) {
-  const targetUrl = `https://twitsave.com/info?url=https://x.com/i/status/${tweetId}`;
-  let variants = [];
-  
-  try {
-    const res = await quickFetch(targetUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }
-    }, 3500);
-    
-    if (!res.ok) return [];
-    const html = await res.text();
+// 核心杀手锏：全网免费渠道高并发联合作战引擎
+async function getGlobalVideoVariants(tweetId) {
+  const tweetUrl = `https://x.com/i/status/${tweetId}`;
+  const uniqueUrls = new Set();
+  const variants = [];
 
-    // 正则提取包含有声 MP4 的下载按钮区域
-    // TwitSave 格式通常为: href="https://...download.php?vid=..." 并在附近有 (HD) 或 (SD) 字样
-    const downloadBlockRegex = /href="([^"]+download\.php[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let match;
-    let urlsSet = new Set();
-
-    while ((match = downloadBlockRegex.exec(html)) !== null) {
-      let downloadUrl = match[1];
-      let innerText = match[2].toUpperCase();
-      
-      if (urlsSet.has(downloadUrl)) continue;
-      urlsSet.add(downloadUrl);
-
-      let score = 360;
-      let label = '标清画质 (SD)';
-
-      if (innerText.includes('HD') || innerText.includes('ORIGINAL') || innerText.includes('HIGH')) {
-        score = 1080;
-        label = '超清原画 (HD)';
-      } else if (innerText.includes('720')) {
-        score = 720;
-        label = '高清 720p';
-      } else if (innerText.includes('480')) {
-        score = 480;
-        label = '清晰 480p';
-      }
-
-      variants.push({ url: downloadUrl, score, label });
-    }
-  } catch (e) {
-    console.error('TwitSave 深度解析失败:', e.message);
+  function registerVariant(url, score, label) {
+    if (!url || uniqueUrls.has(url)) return;
+    uniqueUrls.add(url);
+    variants.push({ url, score, label });
   }
 
-  // 如果连高并发转码平台都拿不到，最后使用 fxtwitter 吐出的单档原画做底牌保护
-  if (variants.length === 0) {
-    try {
-      const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 2000);
-      if (fxRes.ok) {
-        const fxData = await fxRes.json();
-        const fallbackUrl = fxData.tweet?.media?.videos?.[0]?.url;
-        if (fallbackUrl) {
-          variants.push({ url: fallbackUrl, score: 1080, label: '原厂画质 (单档兜底)' });
-        }
+  // 构建高并发并发任务池，所有网络请求同时起飞
+  const tasks = [
+    // 渠道一：VxTwitter Extended API（FixTweet 高级格式流，天生自带多分辨率码率数组）
+    quickFetch(`https://api.vxtwitter.com/i/status/${tweetId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+    }, 2500)
+    .then(r => r.json())
+    .then(data => {
+      if (data && data.media_extended) {
+        data.media_extended.forEach(m => {
+          if ((m.type === 'video' || m.type === 'gif') && m.variants) {
+            m.variants.forEach(v => {
+              if (!v.url) return;
+              let score = 480; let label = '标准标清';
+              if (v.url.includes('1080p') || v.url.includes('1080x') || (v.bitrate && v.bitrate > 2000000)) { score = 1080; label = '超清 1080p'; }
+              else if (v.url.includes('720p') || v.url.includes('720x') || (v.bitrate && v.bitrate > 1000000)) { score = 720; label = '高清 720p'; }
+              else if (v.url.includes('480p') || v.url.includes('480x')) { score = 480; label = '清晰 480p'; }
+              else if (v.url.includes('360p') || v.url.includes('360x')) { score = 360; label = '流畅 360p'; }
+              registerVariant(v.url, score, label);
+            });
+          }
+        });
       }
-    } catch (e) {}
-  }
+    }).catch(() => {}),
 
+    // 渠道二：TwitSave 平台网页转码解包提取
+    quickFetch(`https://twitsave.com/info?url=${tweetUrl}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    }, 3000)
+    .then(r => r.text())
+    .then(html => {
+      const regex = /href="([^"]*download\.php[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+      let match;
+      while ((match = regex.exec(html)) !== null) {
+        let dUrl = match[1];
+        if (!dUrl.startsWith('http')) dUrl = 'https://twitsave.com' + dUrl;
+        let txt = match[2].toUpperCase();
+        let score = 480; let label = '标清画质 (SD)';
+        if (txt.includes('HD') || txt.includes('ORIGINAL') || txt.includes('HIGH') || txt.includes('1080')) { score = 1080; label = '超清原画 (HD)'; }
+        else if (txt.includes('720')) { score = 720; label = '高清 720p'; }
+        else if (txt.includes('480')) { score = 480; label = '清晰 480p'; }
+        registerVariant(dUrl, score, label);
+      }
+    }).catch(() => {}),
+
+    // 渠道三：Cobalt 分布式强力混淆解包节点
+    quickFetch('https://co.wuk.sh/api/json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ url: tweetUrl, videoQuality: '720', filenamePattern: 'basic' })
+    }, 2500)
+    .then(r => r.json())
+    .then(d => { if (d && d.url) registerVariant(d.url, 720, '高清 720p (弹性节点)'); })
+    .catch(() => {}),
+
+    // 渠道四：FxTwitter 基础单档流兜底
+    quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, 2000)
+    .then(r => r.json())
+    .then(data => {
+      if (data && data.tweet && data.tweet.media && data.tweet.media.videos) {
+        data.tweet.media.videos.forEach(v => {
+          let score = 1080;
+          if (v.width && v.height) score = Math.max(v.width, v.height);
+          registerVariant(v.url, score, `${score}p (原厂默认)`);
+        });
+      }
+    }).catch(() => {})
+  ];
+
+  // 阻塞等待所有清洗渠道执行完毕（或超时失败）
+  await Promise.allSettled(tasks);
+
+  // 强制按照清晰度指标从高到低完成最终清洗排序
   return variants.sort((a, b) => b.score - a.score);
 }
 
-// 发送视频流封装逻辑
+// 视频定向发送器
 async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
   const MAX_URL_SIZE = 20 * 1024 * 1024;
   const MAX_BOT_SIZE = 50 * 1024 * 1024;
@@ -120,7 +145,7 @@ async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
     const sizeInMB = size > 0 ? (size / (1024 * 1024)).toFixed(1) : '未知';
     const originalTweetLink = `https://x.com/i/status/${tweetId}`;
     
-    const overSizeCaption = `⚠️ 提示：该画质过大 (${sizeInMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此无损下载该视频</a> | <a href="${originalTweetLink}">查看原推特</a>`;
+    const overSizeCaption = `⚠️ 提示：当前画质体积过大 (${sizeInMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此无损下载该视频</a> | <a href="${originalTweetLink}">查看原推特</a>`;
     
     await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
@@ -133,7 +158,7 @@ async function sendSpecificVideo(chatId, tweetId, variant, size, caption) {
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // ================= 逻辑分流 A：处理控制面板回调 =================
+  // ================= 逻辑分流 A：处理控制面板按钮请求 =================
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
     if (ALLOWED_USER_ID && String(callback.from?.id) !== String(ALLOWED_USER_ID)) {
@@ -155,20 +180,20 @@ export default async function handler(req, res) {
       const progressRes = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在多路同步请求转码网关探测体积..." })
+        body: JSON.stringify({ chat_id: chatId, text: "🔍 正在进行全网多渠道数据清洗与体积探测..." })
       });
       const progressData = await progressRes.json();
       const progressMsgId = progressData.result?.message_id;
 
       try {
-        const sortedVariants = await fetchMultiQualities(tweetId);
+        const sortedVariants = await getGlobalVideoVariants(tweetId);
 
         if (sortedVariants.length === 0) {
-          if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: "❌ 暂未获取到有效的视频流分级列表。" }) });
+          if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: "❌ 聚合解析矩阵未能在任何渠道发现可用视频源。" }) });
           return res.status(200).send('OK');
         }
 
-        // 并发探测体积
+        // 并发探测提取出所有线路的文件体积
         const sizePromises = sortedVariants.map(async (v) => {
           try {
             const hRes = await quickFetch(v.url, { method: 'HEAD' }, 2000);
@@ -179,7 +204,7 @@ export default async function handler(req, res) {
 
         const keyboard = [];
         sortedVariants.forEach((v, idx) => {
-          const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '极速直连投递';
+          const sizeMB = sizes[idx] > 0 ? `${(sizes[idx] / (1024 * 1024)).toFixed(1)} MB` : '极速发货链路';
           keyboard.push([{
             text: `${v.label} - ${sizeMB}`,
             callback_data: `send_q:${tweetId}:${idx}`
@@ -192,14 +217,14 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             chat_id: chatId,
             message_id: progressMsgId,
-            text: `📊 <b>该视频多档转码清晰度清单</b>\n下方每一档皆可点击，体积符合直接发文件，超限发送直链：`,
+            text: `📊 <b>聚合矩阵成功洗出以下独立画质档位</b>\n点击对应档位，机器人将强制采用该画质为你发送文件：`,
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: keyboard }
           })
         });
 
       } catch (err) {
-        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 探测发生异常: ${err.message}` }) });
+        if (progressMsgId) await fetch(`${TELEGRAM_API}/editMessageText`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 发生未知异常: ${err.message}` }) });
       }
     }
 
@@ -208,24 +233,24 @@ export default async function handler(req, res) {
       const targetIdx = parseInt(indexStr, 10);
 
       try {
-        const sortedVariants = await fetchMultiQualities(tweetId);
+        const sortedVariants = await getGlobalVideoVariants(tweetId);
         const chosenVariant = sortedVariants[targetIdx];
         if (!chosenVariant) return res.status(200).send('OK');
 
         const hRes = await quickFetch(chosenVariant.url, { method: 'HEAD' }, 2000);
         const size = parseInt(hRes.headers.get('content-length') || '0', 10);
 
-        const caption = `🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>手动指定投递画质: ${chosenVariant.label}</i>`;
+        const caption = `🔗 <a href="https://x.com/i/status/${tweetId}">查看原推特</a>\n⚙️ <i>手动强选重定向画质: ${chosenVariant.label}</i>`;
         await sendSpecificVideo(chatId, tweetId, chosenVariant, size, caption);
       } catch (e) {
-        console.error('面板手动投递失败', e.message);
+        console.error('控制面板投递故障', e.message);
       }
     }
 
     return res.status(200).send('OK');
   }
 
-  // ================= 逻辑分流 B：处理用户发送的 X 链接 =================
+  // ================= 逻辑分流 B：用户发送原始推特链接 =================
   const msg = req.body.message;
   if (!msg || !msg.text) return res.status(200).send('OK');
 
@@ -249,19 +274,18 @@ export default async function handler(req, res) {
   const originalTweetLink = `https://x.com/i/status/${tweetId}`;
 
   try {
-    // 核心调用：去第三方高能缓存库套出多清晰度
-    const sortedVariants = await fetchMultiQualities(tweetId);
+    // 调用联合收割引擎
+    const sortedVariants = await getGlobalVideoVariants(tweetId);
 
     if (sortedVariants.length > 0) {
       let finalSelectedVariant = null;
       let finalSize = 0;
-      const MAX_BOT_SIZE = 50 * 1024 * 1024; // 50MB限制
+      const MAX_BOT_SIZE = 50 * 1024 * 1024;
 
-      // 级联智能降级尝试
+      // 自动级联降级策略（高画质降到 1080p 底线）
       for (const variant of sortedVariants) {
-        // 如果遇到了低于底线 1080p 且我们拿到了多档，执行级联熔断保护
         if (sortedVariants.length > 1 && variant.score < 1080) {
-          break;
+          break; // 熔断保护，低于1080p终止自动猜测
         }
 
         try {
@@ -273,23 +297,20 @@ export default async function handler(req, res) {
             finalSize = size;
             break; 
           }
-        } catch (e) {
-          console.warn('级联单路探测越过');
-        }
+        } catch (e) {}
       }
 
       let caption = `🔗 <a href="${originalTweetLink}">查看原推特</a>`;
 
       if (finalSelectedVariant) {
-        // 如果发生了降级选择（选的不是最高清晰度），给用户打个小标签提示
         if (finalSelectedVariant.url !== sortedVariants[0].url) {
-          caption += `\n💡 <i>最高画质超限，已智能降级适配至: ${finalSelectedVariant.label}</i>`;
+          caption += `\n💡 <i>超清原件过重，智能为你级联无感降级至: ${finalSelectedVariant.label}</i>`;
         } else {
-          caption += `\n💡 <i>完美适配，以最高品投递: ${finalSelectedVariant.label}</i>`;
+          caption += `\n💡 <i>极品画质体积极其完美，以最高品质投递: ${finalSelectedVariant.label}</i>`;
         }
         await sendSpecificVideo(chatId, tweetId, finalSelectedVariant, finalSize, caption);
       } else {
-        // 哪怕所有清晰度都超限了，也拿第一档（最大最清晰的）下发无损直链通知
+        // 说明全都要么超限了，退回第一档无损（最顶级的画质），让 sendSpecificVideo 吐下载直链
         const topVariant = sortedVariants[0];
         try {
           const hRes = await quickFetch(topVariant.url, { method: 'HEAD' }, 1500);
@@ -298,16 +319,15 @@ export default async function handler(req, res) {
         await sendSpecificVideo(chatId, tweetId, topVariant, finalSize, caption);
       }
     } else {
-      // 容错备用
       await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, text: `⚠️ 视频解析失败，请检查原推特链接。\n🔗 <a href="${originalTweetLink}">原推特直链</a>`, parse_mode: 'HTML' })
+        body: JSON.stringify({ chat_id: chatId, text: `⚠️ 聚合解析失败，没有找到可供下载的文件。\n🔗 <a href="${originalTweetLink}">原推特直链</a>`, parse_mode: 'HTML' })
       });
     }
 
   } catch (error) {
-    console.error('[总线报错]:', error.message);
+    console.error('[聚合总线崩塌]:', error.message);
   }
 
   return res.status(200).send('OK');
