@@ -398,6 +398,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         if (!urlSent) {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
             
+            // ✅ 修复：将 ReadableStream 完全读取到内存并转换为 Blob
             const arrayBuffer = await videoRes.arrayBuffer(); 
             const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
 
@@ -412,6 +413,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             formData.append('height', String(variant.height));
             formData.append('disable_content_type_detection', 'true');
             
+            // ✅ 修复：将转换好的 Blob 追加进 formData
             formData.append('video', videoBlob, 'video.mp4');
             
             await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
@@ -443,6 +445,13 @@ export default async function handler(req, res) {
     if (req.body.callback_query) {
         const callback = req.body.callback_query;
         
+        // 白名单校验 (已注释，解决按钮点击无响应的问题)
+        /*
+        if (ALLOWED_USER_ID && String(callback.from?.id) !== String(ALLOWED_USER_ID)) {
+            return res.status(200).send('OK');
+        }
+        */
+
         const chatId = callback.message.chat.id;
         const callbackData = callback.data;
 
@@ -484,16 +493,14 @@ export default async function handler(req, res) {
                 }
 
                 const buttonVariants = trimVariantsForButton(baseVariants);
+                // 按钮直接携带 URL，避免索引错位
                 const keyboard = [];
                 buttonVariants.forEach((v) => {
                     const sizeMB = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
-                    
-                    // ✅ 关键修复：用在 baseVariants 中的索引代替超长的 URL，突破 64字节 限制
-                    const vIndex = baseVariants.indexOf(v);
-                    
+                    const encodedUrl = encodeURIComponent(v.url);
                     keyboard.push([{
                         text: `${v.label} · ${sizeMB}`,
-                        callback_data: `send_q:${tweetId}:${vIndex}`
+                        callback_data: `send_q:${tweetId}:${encodedUrl}`
                     }]);
                 });
 
@@ -519,16 +526,15 @@ export default async function handler(req, res) {
 
         // 1.2 发送用户选中的指定画质
         if (callbackData.startsWith('send_q:')) {
-            // ✅ 关键修复：解析序号，取代解析长链接
-            const [, tweetId, indexStr] = callbackData.split(':');
-            const targetIndex = parseInt(indexStr, 10);
+            const [, tweetId, encodedUrl] = callbackData.split(':');
+            const targetUrl = decodeURIComponent(encodedUrl);
 
             try {
                 const cacheData = await getTweet(tweetId);
                 const { tweet, baseVariants } = cacheData;
                 if (!tweet) return res.status(200).send('OK');
 
-                const chosenVariant = baseVariants[targetIndex];
+                const chosenVariant = baseVariants.find(v => v.url === targetUrl);
                 if (!chosenVariant) return res.status(200).send('OK');
 
                 // 仅探测当前选中档位的体积，不浪费请求
@@ -551,6 +557,13 @@ export default async function handler(req, res) {
     const msg = req.body.message || req.body.channel_post;
     if (!msg || !msg.text) return res.status(200).send('OK');
 
+    // 2. 【关键修改】注释掉或者直接删掉 ALLOWED_USER_ID 的校验
+    /*
+    if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
+        return res.status(200).send('OK');
+    }
+    */
+
     const text = msg.text.trim();
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
@@ -563,6 +576,7 @@ export default async function handler(req, res) {
             body: JSON.stringify({ chat_id: chatId, message_id: messageId })
         });
     } catch (e) {
+        // 如果删不掉，说明没权限或不是管理员，为了防止阻塞，打印一下即可
         console.log('无法删除消息，请检查机器人是否为管理员');
     }
 
