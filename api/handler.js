@@ -351,7 +351,7 @@ function trimVariantsForButton(list) {
 }
 
 // ======================
-// 核心发送函数（修复：size=0 也尝试直发，不直接走超限）
+// 核心发送函数
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
@@ -409,7 +409,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         }
     }
 
-    // URL 失败 → 流式上传兜底（大小未知也尝试上传，让 Telegram 自己判断）
+    // URL 失败 → 流式上传兜底
     if (!urlSent) {
         try {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
@@ -550,17 +550,18 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
     }
 
-    // ================= 用户消息处理（修正自动选档逻辑）
+    // ================= 用户消息处理 =================
     const msg = req.body.message;
     if (!msg || !msg.text) return res.status(200).send('OK');
     if (ALLOWED_USER_ID && String(msg.from?.id) !== String(ALLOWED_USER_ID)) {
         return res.status(200).send('OK');
     }
 
-    const text = msg.text;
+    const text = msg.text.trim();
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
+    // 自动删除用户发送的消息，保持界面整洁
     try {
         await fetch(`${TELEGRAM_API}/deleteMessage`, {
             method: 'POST',
@@ -571,6 +572,21 @@ export default async function handler(req, res) {
         console.error('删除消息权限不足:', e.message);
     }
 
+    // ========== 新增：响应 /start 命令 ==========
+    if (text === '/start') {
+        await fetch(`${TELEGRAM_API}/sendMessage`, {
+            method: 'POST',
+            headers: JSON_HEADERS,
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: '发送 X/Twitter 链接即可解析视频。',
+                parse_mode: 'HTML'
+            })
+        });
+        return res.status(200).send('OK');
+    }
+
+    // 匹配推特链接
     const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
     const match = text.match(twitterRegex);
     if (!match) return res.status(200).send('OK');
@@ -583,21 +599,17 @@ export default async function handler(req, res) {
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
-            // ========== 修正后的自动选档逻辑 ==========
-            // 原则：分辨率优先 → 同分辨率选体积最大 → size=0 不跳过，保底直接发最高分辨率
+            // 自动选档：分辨率优先 → 同分辨率选体积最大
             let best = null;
             let currentRes = -1;
             let bestInCurrentRes = null;
 
             for (const variant of baseVariants) {
-                // 低于最低分辨率要求直接跳过
                 if (variant.score < CONFIG.AUTO_MIN_HEIGHT) continue;
 
                 variant.size = await getFileSize(variant.url);
 
-                // 进入下一个分辨率档位
                 if (variant.score !== currentRes) {
-                    // 上一个分辨率档位有符合条件的，直接选（分辨率优先）
                     if (bestInCurrentRes) {
                         best = bestInCurrentRes;
                         break;
@@ -606,7 +618,6 @@ export default async function handler(req, res) {
                     bestInCurrentRes = null;
                 }
 
-                // 同分辨率下，记录体积最大且不超限的版本
                 if (variant.size === 0 || variant.size <= CONFIG.BOT_UPLOAD_LIMIT) {
                     if (!bestInCurrentRes || variant.size > bestInCurrentRes.size) {
                         bestInCurrentRes = variant;
@@ -614,12 +625,11 @@ export default async function handler(req, res) {
                 }
             }
 
-            // 遍历完还没找到，检查最后一个分辨率档位
             if (!best && bestInCurrentRes) {
                 best = bestInCurrentRes;
             }
 
-            // 极端情况：所有能探测大小的都超限 → 取最高分辨率保底直发
+            // 极端保底：所有可探测的都超限，取最高分辨率尝试
             if (!best) {
                 best = baseVariants.find(v => v.score >= CONFIG.AUTO_MIN_HEIGHT) || baseVariants[0];
             }
