@@ -3,17 +3,17 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ======================
-// 全局功能配置
+// 全局功能配置（精简最优参数）
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
     MIN_DISPLAY_HEIGHT: 240,
-    HEAD_TIMEOUT: 2500,
+    HEAD_TIMEOUT: 1500,
     DOWNLOAD_TIMEOUT: 20000,
-    TWEET_CACHE_MS: 10 * 60 * 1000,
-    SIZE_CACHE_MS: 30 * 60 * 1000,
+    TWEET_CACHE_MS: 15 * 60 * 1000,
+    SIZE_CACHE_MS: 60 * 60 * 1000,
     MAX_CACHE: 500,
-    HEAD_CONCURRENCY: 4,
+    HEAD_CONCURRENCY: 3,
     TG_API_TIMEOUT: 5000
 };
 
@@ -38,6 +38,7 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
     }
 }
 
+// Telegram API 统一封装，非关键请求可跳过JSON解析
 async function tg(method, data, parse = true) {
     const res = await quickFetch(
         `${TELEGRAM_API}/${method}`,
@@ -71,16 +72,10 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 }
 
 // ======================
-// LRU 缓存机制（真正LRU实现）
+// 缓存机制（精简FIFO，取消无意义LRU操作）
 // ======================
-/** LRU缓存读取：访问时刷新条目位置，热门数据不会被提前淘汰 */
 function cacheGet(cache, key) {
-    const value = cache.get(key);
-    if (value !== undefined) {
-        cache.delete(key);
-        cache.set(key, value);
-    }
-    return value;
+    return cache.get(key);
 }
 
 function cacheSet(cache, key, value) {
@@ -94,6 +89,7 @@ function cacheSet(cache, key, value) {
 // ======================
 // 画质列表处理工具
 // ======================
+// 按长边分辨率去重，同档位保留最高码率
 function uniqueQualityVariants(list) {
     const map = new Map();
     for (const v of list) {
@@ -106,6 +102,7 @@ function uniqueQualityVariants(list) {
     return [...map.values()].sort(compareVariant);
 }
 
+// 展示过滤：大于50MB全部保留，≤50MB仅保留最高清一个
 function prepareDisplayVariants(variants) {
     let bestUnderLimitFound = false;
     return variants.filter(v => {
@@ -164,6 +161,8 @@ const tweetPending = new Map();
 async function getTweet(tweetId) {
     const cached = cacheGet(tweetCache, tweetId);
     if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
+        // 命中缓存刷新生命周期，热门内容不提前过期
+        cached.time = Date.now();
         return cached;
     }
 
@@ -198,7 +197,7 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（优化：双方案探测 + 失败也缓存）
+// 文件大小探测（单请求方案，取消多余HEAD兜底）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
@@ -216,7 +215,6 @@ async function getFileSizeInternal(url) {
     const requestPromise = (async () => {
         let size = 0;
         try {
-            // 方案1：Range GET 优先，兼容绝大多数X CDN节点
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
@@ -225,6 +223,7 @@ async function getFileSizeInternal(url) {
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
+            // 主动释放连接，避免CDN挂起
             rRes.body?.cancel?.();
 
             // 优先从 content-range 提取
@@ -236,28 +235,16 @@ async function getFileSizeInternal(url) {
                 }
             }
 
-            // 次选从 content-length 提取
+            // 同请求内兜底 content-length，不发起额外请求
             if (!size) {
                 const contentLength = rRes.headers.get("content-length");
                 if (contentLength) {
                     size = parseInt(contentLength, 10);
                 }
             }
-
-            // 方案2：HEAD 请求兜底，部分CDN对HEAD兼容性更好
-            if (!size) {
-                try {
-                    const hRes = await quickFetch(url, { method: "HEAD" }, CONFIG.HEAD_TIMEOUT);
-                    const contentLength = hRes.headers.get("content-length");
-                    if (contentLength) {
-                        size = parseInt(contentLength, 10);
-                    }
-                } catch {}
-            }
-
         } catch {}
 
-        // 无论成功失败都写入缓存：失败存0，避免重复请求异常节点
+        // 无论成功失败都写入缓存，避免重复请求异常节点
         cacheSet(sizeCache, url, { time: Date.now(), size });
         return size;
     })();
@@ -299,11 +286,9 @@ function dedupeVariants(list) {
     return [...map.values()];
 }
 
-// 优化：按像素面积排序，横竖屏视频统一按画质量级排序
+// 恢复按高度排序，符合视频档位直觉
 function compareVariant(a, b) {
-    const areaA = a.width * a.height;
-    const areaB = b.width * b.height;
-    if (areaA !== areaB) return areaB - areaA;
+    if (a.height !== b.height) return b.height - a.height;
     return b.bitrate - a.bitrate;
 }
 
@@ -390,31 +375,9 @@ function collectVideoVariants(media = {}) {
 // ======================
 // 核心选图与发送逻辑
 // ======================
-// 优化：前3档并发探测 + 后续串行兜底，兼顾速度与稳定性
+// 串行逐个检测，找到第一个合规档立即返回，速度最稳定
 async function findBestUnderLimit(variants) {
-    // 前3个高画质档位并发探测，覆盖90%以上常见视频场景
-    const topCandidates = variants.slice(0, 3);
-    const checkedTop = await Promise.all(
-        topCandidates.map(async v => {
-            if (v.size === 0) {
-                v.size = await getFileSize(v.url);
-            }
-            return v;
-        })
-    );
-
-    // 从并发结果中选取最高画质的合规档
-    const validTop = checkedTop
-        .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
-        .sort(compareVariant);
-    
-    if (validTop.length > 0) {
-        return validTop[0];
-    }
-
-    // 前3档均超限，串行检测剩余低画质，避免无用并发浪费资源
-    for (let i = 3; i < variants.length; i++) {
-        const v = variants[i];
+    for (const v of variants) {
         if (v.size === 0) {
             v.size = await getFileSize(v.url);
         }
@@ -422,7 +385,6 @@ async function findBestUnderLimit(variants) {
             return v;
         }
     }
-
     return null;
 }
 
@@ -449,7 +411,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             disable_content_type_detection: true
         };
 
-        // 优化：URL直发仅尝试1次，失败立即降级上传，减少无效等待
+        // 直发仅尝试1次，失败立即降级，减少无效等待
         try {
             const json = await tg('sendVideo', payload);
             if (json.ok) urlSent = true;
@@ -500,6 +462,7 @@ export default async function handler(req, res) {
         const chatId = callback.message.chat.id;
         const callbackData = callback.data;
 
+        // 非关键请求跳过解析
         tg('answerCallbackQuery', { callback_query_id: callback.id }, false).catch(() => {});
 
         // 1.1 查看所有画质列表
@@ -524,6 +487,7 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
+                // 去重后最多保留6档，覆盖全分辨率
                 const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
                 await fillVariantsSize(displayVariants);
 
@@ -591,6 +555,7 @@ export default async function handler(req, res) {
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
+    // 删消息跳过解析
     tg('deleteMessage', { chat_id: chatId, message_id: messageId }, false).catch(() => {});
 
     if (text === '/start') {
