@@ -6,7 +6,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 // 全局功能配置
 // ======================
 const CONFIG = {
-    BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
+    BOT_UPLOAD_LIMIT: 50 * 1024 * 1024, // Telegram Bot API 统一50MB上限，URL直传同样遵守
     MIN_DISPLAY_HEIGHT: 240,
     HEAD_TIMEOUT: 1200,
     DOWNLOAD_TIMEOUT: 20000,
@@ -15,8 +15,7 @@ const CONFIG = {
     FAIL_SIZE_CACHE_MS: 1 * 60 * 1000,
     MAX_CACHE: 500,
     HEAD_CONCURRENCY: 4,
-    TG_API_TIMEOUT: 5000,
-    URL_CHECK_TIMEOUT: 1500
+    TG_API_TIMEOUT: 5000
 };
 
 // ======================
@@ -97,23 +96,6 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     return results;
 }
 
-// 视频URL可用性预检：提前过滤非视频类型，避免浪费Telegram请求
-async function checkVideoUrl(url) {
-    try {
-        const r = await quickFetch(url, {
-            method: "HEAD"
-        }, CONFIG.URL_CHECK_TIMEOUT);
-
-        return {
-            ok: r.ok,
-            type: r.headers.get("content-type"),
-            length: r.headers.get("content-length")
-        };
-    } catch {
-        return { ok: false };
-    }
-}
-
 // ======================
 // 画质列表处理工具
 // ======================
@@ -142,10 +124,17 @@ function prepareDisplayVariants(variants) {
 }
 
 // ======================
-// 消息文案生成（修复MB重复单位 + 区分过大/投递失败）
+// 消息文案生成（修复MB重复 + 新增大小未知提示）
 // ======================
 function buildCaption(tweet, options = {}) {
-    const { variant = null, isManual = false, isOverSize = false, autoSelected = false, isSendFailed = false } = options;
+    const { 
+        variant = null, 
+        isManual = false, 
+        isOverSize = false, 
+        autoSelected = false, 
+        isSendFailed = false,
+        isSizeUnknown = false
+    } = options;
     const authorLink = `https://x.com/${tweet.author.screen_name}`;
     const originalTweetLink = `https://x.com/i/status/${tweet.id}`;
     const lines = [];
@@ -164,6 +153,12 @@ function buildCaption(tweet, options = {}) {
             lines.push(`⚠️ 该画质过大 (${sizeMB}) 无法直接发送\n🚀 高清原片链接过长，请通过画质按钮选择下载`);
         } else {
             lines.push(`⚠️ 该画质过大 (${sizeMB}) 无法直接发送\n🚀 <a href="${variant.url}">点此下载高清原片</a>`);
+        }
+    } else if (isSizeUnknown && variant) {
+        if (variant.url.length > 300) {
+            lines.push(`⚠️ 无法检测视频大小\n🚀 原片链接过长，请通过画质按钮选择下载`);
+        } else {
+            lines.push(`⚠️ 无法检测视频大小\n🚀 <a href="${variant.url}">点此下载高清原片</a>`);
         }
     } else if (isSendFailed && variant) {
         if (variant.url.length > 300) {
@@ -247,7 +242,7 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（修复并发计时警告）
+// 文件大小缓存（核心修复：大文件探测优化）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
@@ -269,10 +264,11 @@ async function getFileSizeInternal(url) {
     const requestPromise = (async () => {
         try {
             const sizeStart = Date.now();
+            // 修复1：Range范围从2字节扩大到1MB，提升大文件场景下CDN返回总大小的概率
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
-                    "Range": "bytes=0-1",
+                    "Range": "bytes=0-1048575",
                     "Accept-Encoding": "identity"
                 }
             }, CONFIG.HEAD_TIMEOUT);
@@ -282,7 +278,8 @@ async function getFileSizeInternal(url) {
 
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
-                const match = contentRange.match(/\/(\d+)$/);
+                // 修复2：正则去掉结尾$，兼容不同CDN返回格式；匹配/后的数字即为文件总大小
+                const match = contentRange.match(/\/(\d+)/);
                 if (match) {
                     const size = parseInt(match[1], 10);
                     cacheSet(sizeCache, url, { time: Date.now(), size });
@@ -290,6 +287,7 @@ async function getFileSizeInternal(url) {
                 }
             }
 
+            // 兜底：部分CDN返回完整content-length
             const contentLength = rRes.headers.get("content-length");
             if (contentLength) {
                 const size = parseInt(contentLength, 10);
@@ -297,6 +295,7 @@ async function getFileSizeInternal(url) {
                 return size;
             }
 
+            // 仍无法获取大小，标记为失败
             cacheSet(sizeCache, url, {
                 time: Date.now(),
                 size: 0,
@@ -468,7 +467,7 @@ async function findBestUnderLimit(variants) {
 }
 
 // ======================
-// 自动降档发送：高画质失败自动试下一档，全失败才返回下载链接
+// 自动降档发送（修复：未知大小档位直接跳过，不冒险）
 // ======================
 async function sendBestAvailable(chatId, tweet, variants) {
     const replyMarkup = {
@@ -476,15 +475,8 @@ async function sendBestAvailable(chatId, tweet, variants) {
     };
 
     for (const v of variants) {
-        // 明确超大小的档位直接跳过
-        if (v.size > 0 && v.size > CONFIG.BOT_UPLOAD_LIMIT) {
-            continue;
-        }
-
-        // 预检URL类型，非视频直接跳过
-        const check = await checkVideoUrl(v.url);
-        if (!check.ok || !check.type?.includes("video")) {
-            console.log(`档位 ${v.label} 预检不通过，跳过`);
+        // 修复：大小超限 或 探测失败（size=0）均直接跳过，杜绝超大视频风险
+        if (v.size > CONFIG.BOT_UPLOAD_LIMIT || v.size === 0) {
             continue;
         }
 
@@ -513,12 +505,12 @@ async function sendBestAvailable(chatId, tweet, variants) {
         }
     }
 
-    console.log("所有档位直链均投递失败");
+    console.log("所有合规档位直链均投递失败");
     return false;
 }
 
 // ======================
-// 单档指定发送（用于手动选择画质场景）
+// 单档指定发送（修复：size=0不再尝试直传）
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, autoSelected = false } = options;
@@ -527,8 +519,8 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]]
     };
 
-    // 场景1：明确大小超限，直接返回下载链接
-    if (variant.size > 0 && variant.size > CONFIG.BOT_UPLOAD_LIMIT) {
+    // 修复：大小超限 或 大小探测失败，均不尝试直传，直接返回下载链接
+    if (variant.size >= CONFIG.BOT_UPLOAD_LIMIT) {
         await tg('sendMessage', {
             chat_id: chatId,
             text: buildCaption(tweet, { variant, isManual, autoSelected, isOverSize: true }),
@@ -538,19 +530,17 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         return;
     }
 
-    // 场景2：大小合规或未知，先预检再尝试发送
-    const check = await checkVideoUrl(variant.url);
-    if (!check.ok || !check.type?.includes("video")) {
-        console.log("URL类型异常，跳过直传", check);
+    if (variant.size === 0) {
         await tg('sendMessage', {
             chat_id: chatId,
-            text: buildCaption(tweet, { variant, isManual, autoSelected, isSendFailed: true }),
+            text: buildCaption(tweet, { variant, isManual, autoSelected, isSizeUnknown: true }),
             parse_mode: 'HTML',
             reply_markup: replyMarkup
         });
         return;
     }
 
+    // 大小合规，正常尝试直传
     const payload = {
         chat_id: chatId,
         video: variant.url,
@@ -586,7 +576,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 }
 
 // ======================
-// Serverless 主入口
+// Serverless 主入口（修复：兜底逻辑不再盲目取最高画质）
 // ======================
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
@@ -663,7 +653,7 @@ export default async function handler(req, res) {
             return res.status(200).send('OK');
         }
 
-        // 1.2 发送指定画质（手动选择，单档尝试）
+        // 1.2 发送指定画质
         if (callbackData.startsWith('send_q:')) {
             const [, tweetId, indexStr] = callbackData.split(':');
             const variantIndex = parseInt(indexStr, 10);
@@ -753,14 +743,17 @@ export default async function handler(req, res) {
             const sendSuccess = await sendBestAvailable(chatId, tweet, baseVariants);
 
             if (!sendSuccess) {
-                // 所有档位均失败，返回最高画质下载链接
-                const topVariant = baseVariants[0];
-                if (topVariant.size === 0) {
-                    topVariant.size = await getFileSize(topVariant.url);
-                }
+                // 修复：优先取有有效大小的最高档位，而非直接取最高画质
+                const topVariant = baseVariants.find(v => v.size > 0) || baseVariants[0];
+                const isSizeUnknown = topVariant.size === 0;
+
                 await tg('sendMessage', {
                     chat_id: chatId,
-                    text: buildCaption(tweet, { variant: topVariant, isSendFailed: true }),
+                    text: buildCaption(tweet, { 
+                        variant: topVariant, 
+                        isOverSize: !isSizeUnknown,
+                        isSizeUnknown 
+                    }),
                     parse_mode: 'HTML',
                     reply_markup: { inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]] }
                 });
