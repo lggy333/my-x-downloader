@@ -13,12 +13,12 @@ const BROWSER_HEADERS = {
 // 全局功能配置
 // ======================
 const CONFIG = {
-    BOT_UPLOAD_LIMIT: 50 * 1024 * 1024, // Telegram Bot API 50MB 上限
+    BOT_UPLOAD_LIMIT: 48 * 1024 * 1024, // 降至 48MB，预留 Multipart Headers & Boundary 安全空间
     MIN_DISPLAY_HEIGHT: 160,            // 允许 320x426 等竖屏低清流
     HEAD_TIMEOUT: 1500,
     DOWNLOAD_TIMEOUT: 30000,            // Worker 下载视频超时
     TG_API_TIMEOUT: 8000,              // 普通 API 操作 8 秒超时
-    TG_UPLOAD_TIMEOUT: 60000,           // 独立大文件上传 60 秒超时
+    TG_UPLOAD_TIMEOUT: 120000,          // 大文件上传提升至 120 秒超时
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
     FAIL_SIZE_CACHE_MS: 1 * 60 * 1000,
@@ -72,21 +72,6 @@ async function quickFetch(url, options = {}, timeoutMs = CONFIG.TG_API_TIMEOUT) 
     }
 }
 
-/**
- * 通用异步重试包装器
- */
-async function retry(fn, times = 2, delayMs = 1000) {
-    for (let i = 0; i < times; i++) {
-        try {
-            return await fn();
-        } catch (e) {
-            if (i === times - 1) throw e;
-            console.log(`[重试] 操作失败: ${e.message}，将在 ${delayMs}ms 后重试第 ${i + 1} 次...`);
-            await new Promise(r => setTimeout(r, delayMs));
-        }
-    }
-}
-
 async function tg(method, data, parse = true) {
     const res = await quickFetch(
         `${TELEGRAM_API}/${method}`,
@@ -102,9 +87,9 @@ async function tg(method, data, parse = true) {
 }
 
 /**
- * Worker 本地下载文件并通过 Multipart FormData 提交 Telegram (使用独立 60s 超时)
+ * Single Multipart 上传基础函数（允许自定义超时）
  */
-async function tgMultipart(method, fields, fileField, fileBlob, fileName = "video.mp4") {
+async function tgMultipart(method, fields, fileField, fileBlob, fileName = "video.mp4", timeoutMs = CONFIG.TG_UPLOAD_TIMEOUT) {
     const formData = new FormData();
     for (const [k, v] of Object.entries(fields)) {
         if (typeof v === 'object') {
@@ -121,9 +106,33 @@ async function tgMultipart(method, fields, fileField, fileBlob, fileName = "vide
             method: 'POST',
             body: formData
         },
-        CONFIG.TG_UPLOAD_TIMEOUT // 使用独立的 60s 大文件上传超时
+        timeoutMs
     );
     return await res.json();
+}
+
+/**
+ * 专为 Multipart 设计的轻量级 Fallback 上传（一次性快速重试，带日志打点）
+ */
+async function tgMultipartWithFallback(method, fields, fileField, fileBlob, fileName = "video.mp4") {
+    const sizeMB = (fileBlob.size / (1024 * 1024)).toFixed(1);
+    
+    console.log(`[TG上传] 准备提交 Multipart | 大小: ${sizeMB}MB | 超时上限: ${CONFIG.TG_UPLOAD_TIMEOUT}ms`);
+    const start = Date.now();
+
+    try {
+        const res = await tgMultipart(method, fields, fileField, fileBlob, fileName, CONFIG.TG_UPLOAD_TIMEOUT);
+        console.log(`[TG上传] 收到响应 | 耗时: ${Date.now() - start}ms | Status: ${res.ok ? 'OK' : 'FAIL'}`);
+        return res;
+    } catch (e) {
+        console.warn(`[TG上传] 首次发送失败 (${e.message})，将在 1000ms 后进行最后一次轻量重试...`);
+        await new Promise(r => setTimeout(r, 1000));
+        
+        const retryStart = Date.now();
+        const res = await tgMultipart(method, fields, fileField, fileBlob, fileName, CONFIG.TG_UPLOAD_TIMEOUT);
+        console.log(`[TG上传] 重试响应收到 | 耗时: ${Date.now() - retryStart}ms | Status: ${res.ok ? 'OK' : 'FAIL'}`);
+        return res;
+    }
 }
 
 async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
@@ -500,18 +509,16 @@ async function sendBestAvailable(chatId, tweet, variants) {
     };
 
     for (const v of variants) {
-        // 核心修复 1: 解除 v.size === 0 的拦截，仅过滤明确大于 50MB 的视频
         if (v.size > CONFIG.BOT_UPLOAD_LIMIT) {
             continue;
         }
 
-        // 过滤异常微小极低画质
         if (v.width < 160 || v.height < 160) {
             console.log(`跳过异常尺寸: ${v.label}`);
             continue;
         }
 
-        // 策略 A: 优先尝试 Direct URL 发送 (附带 width/height 显式元数据)
+        // 策略 A: 优先尝试 Direct URL 发送
         const payload = {
             chat_id: chatId,
             video: v.url,
@@ -538,7 +545,7 @@ async function sendBestAvailable(chatId, tweet, variants) {
             console.log(`直链请求异常 (${e.message})，准备触发 Worker 中转上传...`);
         }
 
-        // 策略 B: Worker 中转上传 (Blob 裸流 + 2次重试 + 60s 长超时)
+        // 策略 B: Worker 中转上传
         try {
             console.log(`正在通过 Worker 下载视频流 (${v.label})...`);
             const dlStart = Date.now();
@@ -549,37 +556,31 @@ async function sendBestAvailable(chatId, tweet, variants) {
 
             if (!fileRes.ok) throw new Error(`HTTP ${fileRes.status}`);
 
-            // 核心修复 2: 不经过 arrayBuffer，直接拿 blob 避免内存二次复制
+            // 增加 Content-Type 检查，避免将 CDN 抛出的 HTML 错误页当作视频上传
+            const contentType = fileRes.headers.get("content-type");
+            if (contentType && !contentType.includes("video") && !contentType.includes("octet-stream")) {
+                throw new Error(`Invalid video content-type: ${contentType}`);
+            }
+
             const blob = await fileRes.blob();
-            console.log(`Worker 下载成功 (${(blob.size / 1024 / 1024).toFixed(1)}MB)，耗时: ${Date.now() - dlStart}ms，开始带重试的 Multipart 上传...`);
+            console.log(`Worker 下载成功 (${(blob.size / 1024 / 1024).toFixed(1)}MB)，耗时: ${Date.now() - dlStart}ms`);
 
-            const uploadStart = Date.now();
-            
-            // 核心修复 3: 使用 retry 包裹 Multipart 上传，防止 15~30s 瞬态断开
-            const uploadJson = await retry(async () => {
-                return await tgMultipart('sendVideo', {
-                    chat_id: chatId,
-                    caption: buildCaption(tweet, { variant: v, autoSelected: true }),
-                    parse_mode: 'HTML',
-                    show_caption_above_media: true,
-                    supports_streaming: true,
-                    width: v.width,
-                    height: v.height
-                }, 'video', blob, `${tweet.id}.mp4`);
-            }, 2, 1000);
-
-            const uploadCost = Date.now() - uploadStart;
-            // 核心修复 4: 结构化详细日志
-            console.log(`TG Multipart 上传完毕:`, {
-                sizeMB: (blob.size / 1024 / 1024).toFixed(1),
-                costMs: uploadCost,
-                ok: uploadJson.ok,
-                description: uploadJson.description || "Success"
-            });
+            // 使用专用的 Fallback 函数（120s 超时 + 阶段日志 + 1次快速重试）
+            const uploadJson = await tgMultipartWithFallback('sendVideo', {
+                chat_id: chatId,
+                caption: buildCaption(tweet, { variant: v, autoSelected: true }),
+                parse_mode: 'HTML',
+                show_caption_above_media: true,
+                supports_streaming: true,
+                width: v.width,
+                height: v.height
+            }, 'video', blob, `${tweet.id}.mp4`);
 
             if (uploadJson.ok) {
                 console.log(`✅ Worker 中转上传成功 | 最终档位: ${v.label}`);
                 return true;
+            } else {
+                console.warn(`TG Multipart 上传拒绝: ${uploadJson.description}`);
             }
         } catch (err) {
             console.error(`Worker 中转上传最终失败: ${err.message}`);
@@ -591,7 +592,7 @@ async function sendBestAvailable(chatId, tweet, variants) {
 }
 
 // ======================
-// 单档指定发送（包含降级 Worker 中转）
+// 单档指定发送
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, autoSelected = false } = options;
@@ -641,19 +642,22 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         }, CONFIG.DOWNLOAD_TIMEOUT);
 
         if (fileRes.ok) {
+            const contentType = fileRes.headers.get("content-type");
+            if (contentType && !contentType.includes("video") && !contentType.includes("octet-stream")) {
+                throw new Error(`Invalid video content-type: ${contentType}`);
+            }
+
             const blob = await fileRes.blob();
 
-            const uploadJson = await retry(async () => {
-                return await tgMultipart('sendVideo', {
-                    chat_id: chatId,
-                    caption: buildCaption(tweet, { variant, isManual, autoSelected }),
-                    parse_mode: 'HTML',
-                    show_caption_above_media: true,
-                    supports_streaming: true,
-                    width: variant.width,
-                    height: variant.height
-                }, 'video', blob, `${tweetId}.mp4`);
-            }, 2, 1000);
+            const uploadJson = await tgMultipartWithFallback('sendVideo', {
+                chat_id: chatId,
+                caption: buildCaption(tweet, { variant, isManual, autoSelected }),
+                parse_mode: 'HTML',
+                show_caption_above_media: true,
+                supports_streaming: true,
+                width: variant.width,
+                height: variant.height
+            }, 'video', blob, `${tweetId}.mp4`);
 
             if (uploadJson.ok) {
                 console.log(`✅ Worker 中转上传成功 | ${variant.label}`);
@@ -805,10 +809,10 @@ export default async function handler(req, res) {
 📌 使用方式：直接发送 X / Twitter 推文链接，机器人会自动解析并发送视频/图片。
 
 ✨ 功能特性：
-• 自动选择 ≤50MB 的最高画质发送
+• 自动选择 ≤48MB 的最高画质发送
 • 支持手动切换不同清晰度
 • 自动识别图片与纯文本推文
-• 超 50MB 视频提供下载链接`,
+• 超 48MB 视频提供下载链接`,
             parse_mode: 'HTML',
             disable_web_page_preview: true
         });
