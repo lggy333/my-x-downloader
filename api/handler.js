@@ -3,18 +3,19 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ======================
-// 全局功能配置（精简最优参数）
+// 全局功能配置（最优稳定参数）
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
     MIN_DISPLAY_HEIGHT: 240,
-    HEAD_TIMEOUT: 1500,
+    HEAD_TIMEOUT: 2500,
     DOWNLOAD_TIMEOUT: 20000,
-    TWEET_CACHE_MS: 15 * 60 * 1000,
-    SIZE_CACHE_MS: 60 * 60 * 1000,
+    TWEET_CACHE_MS: 10 * 60 * 1000,
+    SIZE_CACHE_MS: 30 * 60 * 1000,
     MAX_CACHE: 500,
-    HEAD_CONCURRENCY: 3,
-    TG_API_TIMEOUT: 5000
+    HEAD_CONCURRENCY: 4,
+    TG_API_TIMEOUT: 5000,
+    FAIL_SIZE_CACHE_MS: 60 * 1000 // 失败探测短缓存，避免污染
 };
 
 // ======================
@@ -72,7 +73,7 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 }
 
 // ======================
-// 缓存机制（精简FIFO，取消无意义LRU操作）
+// 缓存机制（精简FIFO，无额外开销）
 // ======================
 function cacheGet(cache, key) {
     return cache.get(key);
@@ -160,9 +161,8 @@ const tweetPending = new Map();
 
 async function getTweet(tweetId) {
     const cached = cacheGet(tweetCache, tweetId);
+    // 取消热刷新，按原始生命周期自然过期，避免内存堆积
     if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
-        // 命中缓存刷新生命周期，热门内容不提前过期
-        cached.time = Date.now();
         return cached;
     }
 
@@ -197,7 +197,7 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小探测（单请求方案，取消多余HEAD兜底）
+// 文件大小探测（单请求 + 长短缓存分离）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
@@ -226,7 +226,7 @@ async function getFileSizeInternal(url) {
             // 主动释放连接，避免CDN挂起
             rRes.body?.cancel?.();
 
-            // 优先从 content-range 提取
+            // 优先从 content-range 提取总大小
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
@@ -244,8 +244,15 @@ async function getFileSizeInternal(url) {
             }
         } catch {}
 
-        // 无论成功失败都写入缓存，避免重复请求异常节点
-        cacheSet(sizeCache, url, { time: Date.now(), size });
+        // 成功正常长缓存，失败仅短缓存，避免临时故障长期污染
+        if (size > 0) {
+            cacheSet(sizeCache, url, { time: Date.now(), size });
+        } else {
+            cacheSet(sizeCache, url, {
+                time: Date.now() - CONFIG.SIZE_CACHE_MS + CONFIG.FAIL_SIZE_CACHE_MS,
+                size: 0
+            });
+        }
         return size;
     })();
 
@@ -286,7 +293,7 @@ function dedupeVariants(list) {
     return [...map.values()];
 }
 
-// 恢复按高度排序，符合视频档位直觉
+// 恢复按高度降序 + 码率降序，符合X视频档位直觉
 function compareVariant(a, b) {
     if (a.height !== b.height) return b.height - a.height;
     return b.bitrate - a.bitrate;
@@ -312,7 +319,7 @@ function parseVideoVariant(v, idx = 0) {
     const isHLS = type.includes("mpegURL") || type.includes("m3u8");
 
     return {
-        url: normalizeVideoUrl(v.url),
+        url: normalizeVideoUrl(url),
         width,
         height,
         bitrate: v.bitrate || 0,
@@ -375,9 +382,31 @@ function collectVideoVariants(media = {}) {
 // ======================
 // 核心选图与发送逻辑
 // ======================
-// 串行逐个检测，找到第一个合规档立即返回，速度最稳定
+// 优化：前2档并发探测（覆盖90%场景），后续串行兜底，兼顾速度与稳定
 async function findBestUnderLimit(variants) {
-    for (const v of variants) {
+    // 最高两档并发检测，覆盖绝大多数视频场景
+    const topCandidates = variants.slice(0, 2);
+    const checkedTop = await Promise.all(
+        topCandidates.map(async v => {
+            if (v.size === 0) {
+                v.size = await getFileSize(v.url);
+            }
+            return v;
+        })
+    );
+
+    // 从并发结果中选最高画质合规档
+    const validTop = checkedTop
+        .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
+        .sort(compareVariant);
+    
+    if (validTop.length > 0) {
+        return validTop[0];
+    }
+
+    // 前两档均超限，串行检测剩余低画质，避免无效并发
+    for (let i = 2; i < variants.length; i++) {
+        const v = variants[i];
         if (v.size === 0) {
             v.size = await getFileSize(v.url);
         }
@@ -385,6 +414,7 @@ async function findBestUnderLimit(variants) {
             return v;
         }
     }
+
     return null;
 }
 
@@ -411,12 +441,16 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             disable_content_type_detection: true
         };
 
-        // 直发仅尝试1次，失败立即降级，减少无效等待
-        try {
-            const json = await tg('sendVideo', payload);
-            if (json.ok) urlSent = true;
-        } catch (e) {
-            console.log("URL 发送失败，降级为上传:", e.message);
+        // 恢复2次重试，短间隔提升直发成功率，减少降级上传
+        for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
+            try {
+                const json = await tg('sendVideo', payload);
+                if (json.ok) urlSent = true;
+                else throw new Error(json.description || "Direct URL send failed");
+            } catch (e) {
+                if (attempt === 0) await new Promise(r => setTimeout(r, 50));
+                else console.log("URL 发送失败，降级为上传:", e.message);
+            }
         }
 
         // 兜底：全量下载后FormData上传
