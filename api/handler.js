@@ -3,7 +3,7 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ======================
-// 全局功能配置（稳定版参数）
+// 全局功能配置
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
@@ -71,6 +71,27 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 }
 
 // ======================
+// LRU 缓存机制（真正LRU实现）
+// ======================
+/** LRU缓存读取：访问时刷新条目位置，热门数据不会被提前淘汰 */
+function cacheGet(cache, key) {
+    const value = cache.get(key);
+    if (value !== undefined) {
+        cache.delete(key);
+        cache.set(key, value);
+    }
+    return value;
+}
+
+function cacheSet(cache, key, value) {
+    if (cache.size >= CONFIG.MAX_CACHE) {
+        const first = cache.keys().next().value;
+        cache.delete(first);
+    }
+    cache.set(key, value);
+}
+
+// ======================
 // 画质列表处理工具
 // ======================
 function uniqueQualityVariants(list) {
@@ -135,24 +156,13 @@ function buildCaption(tweet, options = {}) {
 }
 
 // ======================
-// LRU 缓存机制
-// ======================
-function cacheSet(cache, key, value) {
-    if (cache.size >= CONFIG.MAX_CACHE) {
-        const first = cache.keys().next().value;
-        cache.delete(first);
-    }
-    cache.set(key, value);
-}
-
-// ======================
 // 推文数据缓存
 // ======================
 const tweetCache = new Map();
 const tweetPending = new Map();
 
 async function getTweet(tweetId) {
-    const cached = tweetCache.get(tweetId);
+    const cached = cacheGet(tweetCache, tweetId);
     if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
         return cached;
     }
@@ -188,13 +198,13 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（核心修复区）
+// 文件大小缓存（优化：双方案探测 + 失败也缓存）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
 
 async function getFileSizeInternal(url) {
-    const cached = sizeCache.get(url);
+    const cached = cacheGet(sizeCache, url);
     if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
         return cached.size;
     }
@@ -204,8 +214,9 @@ async function getFileSizeInternal(url) {
     }
 
     const requestPromise = (async () => {
+        let size = 0;
         try {
-            // 修复3: Range 改为 0-1，提升部分CDN兼容性
+            // 方案1：Range GET 优先，兼容绝大多数X CDN节点
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
@@ -214,35 +225,41 @@ async function getFileSizeInternal(url) {
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
-            // 主动释放连接
             rRes.body?.cancel?.();
 
-            // 优先读取 content-range
+            // 优先从 content-range 提取
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
                 if (match) {
-                    // 修复1: 进制参数修正为10，避免返回NaN
-                    const size = parseInt(match[1], 10);
-                    cacheSet(sizeCache, url, { time: Date.now(), size });
-                    return size;
+                    size = parseInt(match[1], 10);
                 }
             }
 
-            // 修复2: 增加 content-length 兜底，兼容不返回range的CDN节点
-            const contentLength = rRes.headers.get("content-length");
-            if (contentLength) {
-                const size = parseInt(contentLength, 10);
-                cacheSet(sizeCache, url, { time: Date.now(), size });
-                return size;
+            // 次选从 content-length 提取
+            if (!size) {
+                const contentLength = rRes.headers.get("content-length");
+                if (contentLength) {
+                    size = parseInt(contentLength, 10);
+                }
             }
 
-            return 0;
-        } catch {
-            return 0;
-        } finally {
-            sizePending.delete(url);
-        }
+            // 方案2：HEAD 请求兜底，部分CDN对HEAD兼容性更好
+            if (!size) {
+                try {
+                    const hRes = await quickFetch(url, { method: "HEAD" }, CONFIG.HEAD_TIMEOUT);
+                    const contentLength = hRes.headers.get("content-length");
+                    if (contentLength) {
+                        size = parseInt(contentLength, 10);
+                    }
+                } catch {}
+            }
+
+        } catch {}
+
+        // 无论成功失败都写入缓存：失败存0，避免重复请求异常节点
+        cacheSet(sizeCache, url, { time: Date.now(), size });
+        return size;
     })();
 
     sizePending.set(url, requestPromise);
@@ -282,10 +299,12 @@ function dedupeVariants(list) {
     return [...map.values()];
 }
 
+// 优化：按像素面积排序，横竖屏视频统一按画质量级排序
 function compareVariant(a, b) {
-    if (a.height !== b.height) return b.height - a.height;
-    if (a.bitrate !== b.bitrate) return b.bitrate - a.bitrate;
-    return 0;
+    const areaA = a.width * a.height;
+    const areaB = b.width * b.height;
+    if (areaA !== areaB) return areaB - areaA;
+    return b.bitrate - a.bitrate;
 }
 
 function parseVideoVariant(v, idx = 0) {
@@ -371,8 +390,31 @@ function collectVideoVariants(media = {}) {
 // ======================
 // 核心选图与发送逻辑
 // ======================
+// 优化：前3档并发探测 + 后续串行兜底，兼顾速度与稳定性
 async function findBestUnderLimit(variants) {
-    for (const v of variants) {
+    // 前3个高画质档位并发探测，覆盖90%以上常见视频场景
+    const topCandidates = variants.slice(0, 3);
+    const checkedTop = await Promise.all(
+        topCandidates.map(async v => {
+            if (v.size === 0) {
+                v.size = await getFileSize(v.url);
+            }
+            return v;
+        })
+    );
+
+    // 从并发结果中选取最高画质的合规档
+    const validTop = checkedTop
+        .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
+        .sort(compareVariant);
+    
+    if (validTop.length > 0) {
+        return validTop[0];
+    }
+
+    // 前3档均超限，串行检测剩余低画质，避免无用并发浪费资源
+    for (let i = 3; i < variants.length; i++) {
+        const v = variants[i];
         if (v.size === 0) {
             v.size = await getFileSize(v.url);
         }
@@ -380,6 +422,7 @@ async function findBestUnderLimit(variants) {
             return v;
         }
     }
+
     return null;
 }
 
@@ -406,17 +449,15 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             disable_content_type_detection: true
         };
 
-        for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
-            try {
-                const json = await tg('sendVideo', payload);
-                if (json.ok) urlSent = true;
-                else throw new Error(json.description || "Direct URL send failed");
-            } catch (e) {
-                if (attempt === 0) await new Promise(r => setTimeout(r, 200));
-                else console.log("URL 发送失败，降级为上传:", e.message);
-            }
+        // 优化：URL直发仅尝试1次，失败立即降级上传，减少无效等待
+        try {
+            const json = await tg('sendVideo', payload);
+            if (json.ok) urlSent = true;
+        } catch (e) {
+            console.log("URL 发送失败，降级为上传:", e.message);
         }
 
+        // 兜底：全量下载后FormData上传
         if (!urlSent) {
             const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
             const arrayBuffer = await videoRes.arrayBuffer();
