@@ -7,7 +7,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024, // Telegram Bot API 50MB 上限
-    MIN_DISPLAY_HEIGHT: 240,
+    MIN_DISPLAY_HEIGHT: 160,            // 允许 320x426 等竖屏低清流
     HEAD_TIMEOUT: 1500,
     DOWNLOAD_TIMEOUT: 20000,
     TWEET_CACHE_MS: 10 * 60 * 1000,
@@ -97,7 +97,7 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 }
 
 // ======================
-// 画质预检工具 (修复：不用 HEAD，改用 GET Range 0-1)
+// 画质预检工具 (GET Range 0-1)
 // ======================
 async function checkVideoUrl(url) {
     try {
@@ -110,7 +110,7 @@ async function checkVideoUrl(url) {
         }, CONFIG.HEAD_TIMEOUT);
 
         const type = r.headers.get("content-type") || "";
-        r.body?.cancel?.(); // 立即释放连接
+        r.body?.cancel?.();
 
         return {
             ok: r.ok || r.status === 206,
@@ -258,7 +258,7 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存 (修复：恢复 Range: bytes=0-1 探测)
+// 文件大小缓存 (Range: bytes=0-1)
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
@@ -469,7 +469,7 @@ async function findBestUnderLimit(variants) {
 }
 
 // ======================
-// 自动降档发送（修复：增加了预检与最低画质过滤）
+// 自动降档发送（已修正过滤门槛）
 // ======================
 async function sendBestAvailable(chatId, tweet, variants) {
     const replyMarkup = {
@@ -477,18 +477,18 @@ async function sendBestAvailable(chatId, tweet, variants) {
     };
 
     for (const v of variants) {
-        // 1. 过滤超限或未知大小
+        // 1. 过滤超限或大小未知的流
         if (v.size > CONFIG.BOT_UPLOAD_LIMIT || v.size === 0) {
             continue;
         }
 
-        // 2. 过滤分辨率过低、可能存在异常的 fallback 流
-        if (v.width < 400 || v.height < 400) {
-            console.log(`跳过极低画质: ${v.label}`);
+        // 2. 仅过滤极微小/损坏的异常流（允许 320x426 等正常低清流）
+        if (v.width < 160 || v.height < 160) {
+            console.log(`跳过异常尺寸流: ${v.label}`);
             continue;
         }
 
-        // 3. 恢复 URL 预检，确保类型为 video
+        // 3. GET Range 预检 Header
         const check = await checkVideoUrl(v.url);
         if (!check.ok || !check.type || !check.type.includes("video")) {
             console.log(`预检未通过，跳过流 ${v.label} (type: ${check.type})`);
@@ -588,7 +588,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 }
 
 // ======================
-// Serverless 主入口（修复：兜底策略获取正确的 Top 变体）
+// Serverless 主入口（已修复 Fallback 逻辑与文案）
 // ======================
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
@@ -753,15 +753,17 @@ export default async function handler(req, res) {
             const sendSuccess = await sendBestAvailable(chatId, tweet, baseVariants);
 
             if (!sendSuccess) {
-                // 修复：优先取符合限制的最高档位；若都超出，则默认取画质最高项 (baseVariants[0])
+                // 修复逻辑：准确区分文件超限、大小未知与纯发送失败
                 const topVariant = baseVariants.find(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) || baseVariants[0];
                 const isSizeUnknown = topVariant.size === 0;
+                const isOverSize = topVariant.size >= CONFIG.BOT_UPLOAD_LIMIT;
 
                 await tg('sendMessage', {
                     chat_id: chatId,
                     text: buildCaption(tweet, { 
                         variant: topVariant, 
-                        isOverSize: !isSizeUnknown,
+                        isOverSize,
+                        isSendFailed: !isOverSize && !isSizeUnknown,
                         isSizeUnknown 
                     }),
                     parse_mode: 'HTML',
