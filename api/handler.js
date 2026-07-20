@@ -12,10 +12,36 @@ const CONFIG = {
     DOWNLOAD_TIMEOUT: 20000,
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
+    FAIL_SIZE_CACHE_MS: 1 * 60 * 1000, // 新增：失败结果仅缓存1分钟
     MAX_CACHE: 500,
     HEAD_CONCURRENCY: 4,
     TG_API_TIMEOUT: 5000
 };
+
+// ======================
+// 性能计时器
+// ======================
+function createTimer(name = "TOTAL") {
+    const start = Date.now();
+    const points = {};
+
+    return {
+        mark(label) {
+            points[label] = Date.now() - start;
+        },
+
+        end() {
+            const total = Date.now() - start;
+            console.log(`\n===== ${name} 性能报告 =====`);
+            for (const [k, v] of Object.entries(points)) {
+                console.log(`${k}: ${v}ms`);
+            }
+            console.log(`TOTAL: ${total}ms`);
+            console.log("====================\n");
+            return { total, points };
+        }
+    };
+}
 
 // ======================
 // 基础工具函数
@@ -188,15 +214,19 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（核心修复区）
+// 文件大小缓存（核心修复区：成功/失败分级缓存）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
 
 async function getFileSizeInternal(url) {
     const cached = sizeCache.get(url);
-    if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
-        return cached.size;
+    if (cached) {
+        const isSuccessValid = !cached.fail && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS;
+        const isFailValid = cached.fail && Date.now() - cached.time < CONFIG.FAIL_SIZE_CACHE_MS;
+        if (isSuccessValid || isFailValid) {
+            return cached.size;
+        }
     }
 
     if (sizePending.has(url)) {
@@ -205,7 +235,7 @@ async function getFileSizeInternal(url) {
 
     const requestPromise = (async () => {
         try {
-            // 修复3: Range 改为 0-1，提升部分CDN兼容性
+            // Range 改为 0-1，提升部分CDN兼容性
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
@@ -222,14 +252,13 @@ async function getFileSizeInternal(url) {
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
                 if (match) {
-                    // 修复1: 进制参数修正为10，避免返回NaN
                     const size = parseInt(match[1], 10);
                     cacheSet(sizeCache, url, { time: Date.now(), size });
                     return size;
                 }
             }
 
-            // 修复2: 增加 content-length 兜底，兼容不返回range的CDN节点
+            // 增加 content-length 兜底，兼容不返回range的CDN节点
             const contentLength = rRes.headers.get("content-length");
             if (contentLength) {
                 const size = parseInt(contentLength, 10);
@@ -237,8 +266,20 @@ async function getFileSizeInternal(url) {
                 return size;
             }
 
+            // 未获取到大小，标记为失败缓存
+            cacheSet(sizeCache, url, {
+                time: Date.now(),
+                size: 0,
+                fail: true
+            });
             return 0;
         } catch {
+            // 请求异常，标记失败缓存
+            cacheSet(sizeCache, url, {
+                time: Date.now(),
+                size: 0,
+                fail: true
+            });
             return 0;
         } finally {
             sizePending.delete(url);
@@ -308,7 +349,7 @@ function parseVideoVariant(v, idx = 0) {
     const isHLS = type.includes("mpegURL") || type.includes("m3u8");
 
     return {
-        url: normalizeVideoUrl(v.url),
+        url: normalizeVideoUrl(v.url), // 修复：原代码错误引用了未定义的 url 变量
         width,
         height,
         bitrate: v.bitrate || 0,
@@ -369,17 +410,34 @@ function collectVideoVariants(media = {}) {
 }
 
 // ======================
-// 核心选图与发送逻辑
+// 核心选图与发送逻辑（优化：前2档并发 + 后续串行兜底）
 // ======================
 async function findBestUnderLimit(variants) {
-    for (const v of variants) {
-        if (v.size === 0) {
-            v.size = await getFileSize(v.url);
-        }
-        if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
+    // 前2档并发探测，覆盖90%以上场景
+    const top = variants.slice(0, 2);
+    const result = await Promise.all(
+        top.map(async v => {
+            if (!v.size) {
+                v.size = await getFileSize(v.url);
+            }
             return v;
-        }
+        })
+    );
+
+    // 从并发结果中筛选符合大小限制的最高画质
+    const ok = result
+        .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
+        .sort(compareVariant);
+
+    if (ok.length) return ok[0];
+
+    // 前两档均超标，串行探测后续低档位
+    for (let i = 2; i < variants.length; i++) {
+        let v = variants[i];
+        if (!v.size) v.size = await getFileSize(v.url);
+        if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) return v;
     }
+
     return null;
 }
 
@@ -448,10 +506,12 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 }
 
 // ======================
-// Serverless 主入口
+// Serverless 主入口（已接入全链路计时器）
 // ======================
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
+    const timer = createTimer("X VIDEO BOT");
 
     // ---------- 1. 回调按钮事件 ----------
     if (req.body.callback_query) {
@@ -468,11 +528,14 @@ export default async function handler(req, res) {
             const progressMsgId = progressData.result?.message_id;
 
             if (!progressMsgId) {
+                timer.end();
                 return res.status(200).send('OK');
             }
 
             try {
                 const cacheData = await getTweet(tweetId);
+                timer.mark("fxTwitter解析完成");
+
                 const { tweet, baseVariants } = cacheData;
                 if (!tweet || baseVariants.length === 0) {
                     await tg('editMessageText', {
@@ -480,11 +543,13 @@ export default async function handler(req, res) {
                         message_id: progressMsgId,
                         text: "❌ 未能获取到有效的视频流资料。"
                     });
+                    timer.end();
                     return res.status(200).send('OK');
                 }
 
                 const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
                 await fillVariantsSize(displayVariants);
+                timer.mark("画质体积探测完成");
 
                 const finalVariants = prepareDisplayVariants(displayVariants);
                 const keyboard = finalVariants.map((v) => {
@@ -514,6 +579,7 @@ export default async function handler(req, res) {
                     });
                 } catch {}
             }
+            timer.end();
             return res.status(200).send('OK');
         }
 
@@ -524,27 +590,41 @@ export default async function handler(req, res) {
 
             try {
                 const cacheData = await getTweet(tweetId);
+                timer.mark("fxTwitter解析完成");
+
                 const { tweet, baseVariants } = cacheData;
-                if (!tweet || !baseVariants[variantIndex]) return res.status(200).send('OK');
+                if (!tweet || !baseVariants[variantIndex]) {
+                    timer.end();
+                    return res.status(200).send('OK');
+                }
 
                 const chosenVariant = baseVariants[variantIndex];
                 if (chosenVariant.size === 0) {
                     chosenVariant.size = await getFileSize(chosenVariant.url);
                 }
+                timer.mark("画质体积探测完成");
 
                 const isOverSize = chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
+                timer.mark("开始发送Telegram");
                 await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true, isOverSize });
+                timer.mark("Telegram发送完成");
             } catch (e) {
                 console.error('[send_q] 手动投递失败', e.message);
             }
+            timer.end();
             return res.status(200).send('OK');
         }
+
+        timer.end();
         return res.status(200).send('OK');
     }
 
     // ---------- 2. 普通消息处理 ----------
     const msg = req.body.message || req.body.channel_post;
-    if (!msg || !msg.text) return res.status(200).send('OK');
+    if (!msg || !msg.text) {
+        timer.end();
+        return res.status(200).send('OK');
+    }
 
     const text = msg.text.trim();
     const chatId = msg.chat.id;
@@ -567,31 +647,42 @@ export default async function handler(req, res) {
             parse_mode: 'HTML',
             disable_web_page_preview: true
         });
+        timer.end();
         return res.status(200).send('OK');
     }
 
     const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
     const match = text.match(twitterRegex);
-    if (!match) return res.status(200).send('OK');
+    if (!match) {
+        timer.end();
+        return res.status(200).send('OK');
+    }
     const tweetId = match[1];
 
     try {
         const cacheData = await getTweet(tweetId);
+        timer.mark("fxTwitter解析完成");
+
         const { tweet, baseVariants } = cacheData;
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
             const best = await findBestUnderLimit(baseVariants);
+            timer.mark("画质选择完成");
             cacheData.time = Date.now();
 
             if (best) {
+                timer.mark("开始发送Telegram");
                 await sendSpecificVideo(chatId, tweet, best, { autoSelected: true });
+                timer.mark("Telegram发送完成");
             } else {
                 const topVariant = baseVariants[0];
                 if (topVariant.size === 0) {
                     topVariant.size = await getFileSize(topVariant.url);
                 }
+                timer.mark("开始发送Telegram");
                 await sendSpecificVideo(chatId, tweet, topVariant, { isOverSize: true });
+                timer.mark("Telegram发送完成");
             }
         } 
         else if (photos.length > 0) {
@@ -616,6 +707,7 @@ export default async function handler(req, res) {
                 }));
                 await tg('sendMediaGroup', { chat_id: chatId, media: mediaGroup });
             }
+            timer.mark("媒体发送完成");
         } 
         else {
             await tg('sendMessage', {
@@ -623,11 +715,13 @@ export default async function handler(req, res) {
                 text: buildCaption(tweet),
                 parse_mode: 'HTML'
             });
+            timer.mark("文本发送完成");
         }
 
     } catch (error) {
         console.error('[总线报错]:', error.message);
     }
 
+    timer.end();
     return res.status(200).send('OK');
 }
