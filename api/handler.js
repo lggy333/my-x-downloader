@@ -12,14 +12,15 @@ const CONFIG = {
     DOWNLOAD_TIMEOUT: 20000,
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
-    FAIL_SIZE_CACHE_MS: 1 * 60 * 1000, // 新增：失败结果仅缓存1分钟
+    FAIL_SIZE_CACHE_MS: 1 * 60 * 1000,
     MAX_CACHE: 500,
     HEAD_CONCURRENCY: 4,
-    TG_API_TIMEOUT: 5000
+    TG_API_TIMEOUT: 5000,
+    URL_CHECK_TIMEOUT: 2000 // 新增：视频URL检测超时
 };
 
 // ======================
-// 性能计时器
+// 性能计时器（全链路总览）
 // ======================
 function createTimer(name = "TOTAL") {
     const start = Date.now();
@@ -94,6 +95,26 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     const workers = Array(Math.min(limit, tasks.length)).fill().map(worker);
     await Promise.all(workers);
     return results;
+}
+
+// 新增：视频URL可用性检测（仅打日志，不拦截）
+async function checkVideoUrl(url) {
+    try {
+        const r = await quickFetch(url, {
+            method: "HEAD"
+        }, CONFIG.URL_CHECK_TIMEOUT);
+
+        const result = {
+            ok: r.ok,
+            type: r.headers.get("content-type"),
+            length: r.headers.get("content-length")
+        };
+        console.log("[视频URL检测]", result);
+        return result;
+    } catch {
+        console.log("[视频URL检测] 请求失败");
+        return { ok: false };
+    }
 }
 
 // ======================
@@ -172,7 +193,7 @@ function cacheSet(cache, key, value) {
 }
 
 // ======================
-// 推文数据缓存
+// 推文数据缓存（已加入细粒度计时）
 // ======================
 const tweetCache = new Map();
 const tweetPending = new Map();
@@ -189,11 +210,20 @@ async function getTweet(tweetId) {
 
     const requestPromise = (async () => {
         try {
+            console.time("fx请求耗时");
             const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, CONFIG.TG_API_TIMEOUT);
-            if (!fxRes.ok) throw new Error("解析失败");
-            const json = await fxRes.json();
+            console.timeEnd("fx请求耗时");
 
+            if (!fxRes.ok) throw new Error("解析失败");
+
+            console.time("fx JSON解析耗时");
+            const json = await fxRes.json();
+            console.timeEnd("fx JSON解析耗时");
+
+            console.time("视频流扫描耗时");
             const rawVariants = collectVideoVariants(json.tweet.media);
+            console.timeEnd("视频流扫描耗时");
+
             const baseVariants = dedupeVariants(rawVariants);
             baseVariants.sort(compareVariant);
 
@@ -214,7 +244,7 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（核心修复区：成功/失败分级缓存）
+// 文件大小缓存（成功/失败分级缓存 + 细粒度计时）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
@@ -235,7 +265,7 @@ async function getFileSizeInternal(url) {
 
     const requestPromise = (async () => {
         try {
-            // Range 改为 0-1，提升部分CDN兼容性
+            console.time("单文件大小探测耗时");
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
@@ -243,11 +273,10 @@ async function getFileSizeInternal(url) {
                     "Accept-Encoding": "identity"
                 }
             }, CONFIG.HEAD_TIMEOUT);
+            console.timeEnd("单文件大小探测耗时");
 
-            // 主动释放连接
             rRes.body?.cancel?.();
 
-            // 优先读取 content-range
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
@@ -258,7 +287,6 @@ async function getFileSizeInternal(url) {
                 }
             }
 
-            // 增加 content-length 兜底，兼容不返回range的CDN节点
             const contentLength = rRes.headers.get("content-length");
             if (contentLength) {
                 const size = parseInt(contentLength, 10);
@@ -266,7 +294,6 @@ async function getFileSizeInternal(url) {
                 return size;
             }
 
-            // 未获取到大小，标记为失败缓存
             cacheSet(sizeCache, url, {
                 time: Date.now(),
                 size: 0,
@@ -274,7 +301,6 @@ async function getFileSizeInternal(url) {
             });
             return 0;
         } catch {
-            // 请求异常，标记失败缓存
             cacheSet(sizeCache, url, {
                 time: Date.now(),
                 size: 0,
@@ -349,7 +375,7 @@ function parseVideoVariant(v, idx = 0) {
     const isHLS = type.includes("mpegURL") || type.includes("m3u8");
 
     return {
-        url: normalizeVideoUrl(v.url), // 修复：原代码错误引用了未定义的 url 变量
+        url: normalizeVideoUrl(v.url),
         width,
         height,
         bitrate: v.bitrate || 0,
@@ -410,10 +436,9 @@ function collectVideoVariants(media = {}) {
 }
 
 // ======================
-// 核心选图与发送逻辑（优化：前2档并发 + 后续串行兜底）
+// 核心选档逻辑（前2档并发 + 后续串行兜底）
 // ======================
 async function findBestUnderLimit(variants) {
-    // 前2档并发探测，覆盖90%以上场景
     const top = variants.slice(0, 2);
     const result = await Promise.all(
         top.map(async v => {
@@ -424,14 +449,12 @@ async function findBestUnderLimit(variants) {
         })
     );
 
-    // 从并发结果中筛选符合大小限制的最高画质
     const ok = result
         .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
         .sort(compareVariant);
 
     if (ok.length) return ok[0];
 
-    // 前两档均超标，串行探测后续低档位
     for (let i = 2; i < variants.length; i++) {
         let v = variants[i];
         if (!v.size) v.size = await getFileSize(v.url);
@@ -441,6 +464,9 @@ async function findBestUnderLimit(variants) {
     return null;
 }
 
+// ======================
+// 视频发送逻辑（核心改动：移除上传降级 + 直链检测日志 + 细粒度计时）
+// ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const { isManual = false, isOverSize = false } = options;
     const tweetId = tweet.id;
@@ -464,35 +490,35 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             disable_content_type_detection: true
         };
 
+        // 发送前检测URL状态（仅打日志）
+        await checkVideoUrl(variant.url);
+
         for (let attempt = 0; attempt < 2 && !urlSent; attempt++) {
             try {
+                console.time("TG sendVideo 直链耗时");
                 const json = await tg('sendVideo', payload);
+                console.timeEnd("TG sendVideo 直链耗时");
+
                 if (json.ok) urlSent = true;
                 else throw new Error(json.description || "Direct URL send failed");
             } catch (e) {
                 if (attempt === 0) await new Promise(r => setTimeout(r, 200));
-                else console.log("URL 发送失败，降级为上传:", e.message);
+                else console.log("URL 发送失败，直接返回下载链接:", e.message);
             }
         }
 
+        // 改动：移除下载上传降级逻辑，失败直接发送带下载链接的消息
         if (!urlSent) {
-            const videoRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
-            const arrayBuffer = await videoRes.arrayBuffer();
-            const videoBlob = new Blob([arrayBuffer], { type: 'video/mp4' });
-
-            const formData = new FormData();
-            formData.append('chat_id', String(chatId));
-            formData.append('caption', caption);
-            formData.append('parse_mode', 'HTML');
-            formData.append('show_caption_above_media', 'true');
-            formData.append('reply_markup', JSON.stringify(replyMarkup));
-            formData.append('supports_streaming', 'true');
-            formData.append('width', String(variant.width));
-            formData.append('height', String(variant.height));
-            formData.append('disable_content_type_detection', 'true');
-            formData.append('video', videoBlob, 'video.mp4');
-            
-            await fetch(`${TELEGRAM_API}/sendVideo`, { method: 'POST', body: formData });
+            console.log("Telegram直链发送全部失败，跳过上传降级，返回下载链接");
+            await tg('sendMessage', {
+                chat_id: chatId,
+                text: buildCaption(tweet, {
+                    variant,
+                    isOverSize: true
+                }),
+                parse_mode: 'HTML',
+                reply_markup: replyMarkup
+            });
         }
     } 
     else {
@@ -506,7 +532,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 }
 
 // ======================
-// Serverless 主入口（已接入全链路计时器）
+// Serverless 主入口（全链路计时器保持不变）
 // ======================
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
