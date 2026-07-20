@@ -3,19 +3,18 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ======================
-// 全局功能配置（优化后参数）
+// 全局功能配置（稳定版参数）
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
     MIN_DISPLAY_HEIGHT: 240,
-    HEAD_TIMEOUT: 1500,
-    DOWNLOAD_TIMEOUT: 15000,
-    TWEET_CACHE_MS: 5 * 60 * 1000,
+    HEAD_TIMEOUT: 2500,
+    DOWNLOAD_TIMEOUT: 20000,
+    TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
-    MAX_CACHE: 300,
-    HEAD_CONCURRENCY: 6,
-    AUTO_SELECT_CONCURRENCY: 3,
-    TG_API_TIMEOUT: 4000
+    MAX_CACHE: 500,
+    HEAD_CONCURRENCY: 4,
+    TG_API_TIMEOUT: 5000
 };
 
 // ======================
@@ -39,8 +38,8 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
     }
 }
 
-// 优化7: 统一封装Telegram API调用，大幅减少重复代码
-async function tg(method, data) {
+// 优化：Telegram API统一封装，支持跳过JSON解析，减少非关键请求延迟
+async function tg(method, data, parse = true) {
     const res = await quickFetch(
         `${TELEGRAM_API}/${method}`,
         {
@@ -50,6 +49,7 @@ async function tg(method, data) {
         },
         CONFIG.TG_API_TIMEOUT
     );
+    if (!parse) return res.ok;
     return await res.json();
 }
 
@@ -74,7 +74,7 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 // ======================
 // 画质列表处理工具
 // ======================
-// 优化3: 同分辨率保留最高码率，返回前强制排序，不受源数据顺序影响
+// 同分辨率保留最高码率，返回前强制排序，不受源数据顺序影响
 function uniqueQualityVariants(list) {
     const map = new Map();
     for (const v of list) {
@@ -87,6 +87,7 @@ function uniqueQualityVariants(list) {
     return [...map.values()].sort(compareVariant);
 }
 
+// 展示过滤：大于50MB全部保留，≤50MB仅保留最高清的一个
 function prepareDisplayVariants(variants) {
     let bestUnderLimitFound = false;
     return variants.filter(v => {
@@ -118,7 +119,12 @@ function buildCaption(tweet, options = {}) {
     
     if (isOverSize && variant) {
         const sizeMB = variant.size > 0 ? `${(variant.size / (1024 * 1024)).toFixed(1)} MB` : '未知';
-        lines.push(`⚠️ 该画质过大 (${sizeMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此下载高清原片</a>`);
+        // 优化：超长URL不直接渲染，避免Telegram HTML解析异常
+        if (variant.url.length > 300) {
+            lines.push(`⚠️ 该画质过大 (${sizeMB}MB) 无法直接发送\n🚀 高清原片链接过长，请通过画质按钮选择下载`);
+        } else {
+            lines.push(`⚠️ 该画质过大 (${sizeMB}MB) 无法直接发送\n🚀 <a href="${variant.url}">点此下载高清原片</a>`);
+        }
     }
 
     lines.push('──────────');
@@ -217,7 +223,7 @@ async function getFileSizeInternal(url) {
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
                 if (match) {
-                    const size = parseInt(match[1], 10);
+                    const size = parseInt(match[1], 1);
                     cacheSet(sizeCache, url, { time: Date.now(), size });
                     return size;
                 }
@@ -356,19 +362,17 @@ function collectVideoVariants(media = {}) {
 // ======================
 // 核心选图与发送逻辑
 // ======================
-// 优化1: 自动选档改为并发探测，速度提升2-3倍
+// 核心修复：改回串行逐个探测，找到合规档立即返回，消除并发等待波动
 async function findBestUnderLimit(variants) {
-    const tasks = variants.map(v => async () => {
+    for (const v of variants) {
         if (v.size === 0) {
             v.size = await getFileSize(v.url);
         }
-        return v;
-    });
-
-    const checked = await limitConcurrency(tasks, CONFIG.AUTO_SELECT_CONCURRENCY);
-    return checked
-        .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
-        .sort(compareVariant)[0] || null;
+        if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
+            return v;
+        }
+    }
+    return null;
 }
 
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
@@ -447,7 +451,8 @@ export default async function handler(req, res) {
         const chatId = callback.message.chat.id;
         const callbackData = callback.data;
 
-        tg('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+        // 非关键请求跳过JSON解析，减少延迟
+        tg('answerCallbackQuery', { callback_query_id: callback.id }, false).catch(() => {});
 
         // 1.1 查看所有画质列表
         if (callbackData.startsWith('list_q:')) {
@@ -471,10 +476,10 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 优化2: 去重后最多保留8档，避免极端情况拖慢速度
-                const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 8);
+                // 优化：去重后最多保留6档，覆盖4K到240p全档位，避免极端情况拖慢
+                const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
                 await fillVariantsSize(displayVariants);
-                cacheData.time = Date.now();
+                // 不刷新tweet缓存生命周期，避免热门推文永久驻留积累旧数据
 
                 const finalVariants = prepareDisplayVariants(displayVariants);
                 const keyboard = finalVariants.map((v) => {
@@ -520,7 +525,6 @@ export default async function handler(req, res) {
                 const chosenVariant = baseVariants[variantIndex];
                 if (chosenVariant.size === 0) {
                     chosenVariant.size = await getFileSize(chosenVariant.url);
-                    cacheData.time = Date.now();
                 }
 
                 const isOverSize = chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
@@ -541,7 +545,8 @@ export default async function handler(req, res) {
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
-    tg('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+    // 非关键请求跳过JSON解析
+    tg('deleteMessage', { chat_id: chatId, message_id: messageId }, false).catch(() => {});
 
     if (text === '/start') {
         await tg('sendMessage', {
