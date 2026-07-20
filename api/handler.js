@@ -2,6 +2,13 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
+// 常规浏览器 User-Agent 模拟，防止 Twitter CDN 限速
+const BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "identity"
+};
+
 // ======================
 // 全局功能配置
 // ======================
@@ -79,7 +86,7 @@ async function tg(method, data, parse = true) {
 }
 
 /**
- * 核心新增：Worker 本地下载文件并通过 Multipart FormData 提交 Telegram
+ * Worker 本地下载文件并通过 Multipart FormData 提交 Telegram
  */
 async function tgMultipart(method, fields, fileField, fileBlob, fileName = "video.mp4") {
     const formData = new FormData();
@@ -119,39 +126,6 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     const workers = Array(Math.min(limit, tasks.length)).fill().map(worker);
     await Promise.all(workers);
     return results;
-}
-
-// ======================
-// 画质预检工具 (含 MP4 Magic Header 校验)
-// ======================
-async function checkVideoUrl(url) {
-    try {
-        const r = await quickFetch(url, {
-            method: "GET",
-            headers: {
-                "Range": "bytes=0-511",
-                "Accept-Encoding": "identity"
-            }
-        }, CONFIG.HEAD_TIMEOUT);
-
-        const type = r.headers.get("content-type") || "";
-        
-        // 读取前几个字节，简单防止网页/重定向包
-        const arrayBuf = await r.arrayBuffer();
-        const bytes = new Uint8Array(arrayBuf.slice(0, 12));
-        
-        // 校验 ftpy/mp4 magic bytes (通常第4-8字节为 ftyp)
-        const isMp4Magic = bytes.length >= 8 && (
-            (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70)
-        );
-
-        return {
-            ok: (r.ok || r.status === 206) && isMp4Magic,
-            type
-        };
-    } catch (e) {
-        return { ok: false, type: "" };
-    }
 }
 
 // ======================
@@ -315,8 +289,8 @@ async function getFileSizeInternal(url) {
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
-                    "Range": "bytes=0-1",
-                    "Accept-Encoding": "identity"
+                    ...BROWSER_HEADERS,
+                    "Range": "bytes=0-1"
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
@@ -521,7 +495,7 @@ async function sendBestAvailable(chatId, tweet, variants) {
             continue;
         }
 
-        // 策略 A: 优先使用 Direct URL 模式，零 Serverless 流量损耗
+        // 策略 A: 优先尝试 Direct URL 发送 (附带 width/height 显式元数据)
         const payload = {
             chat_id: chatId,
             video: v.url,
@@ -529,7 +503,9 @@ async function sendBestAvailable(chatId, tweet, variants) {
             parse_mode: 'HTML',
             show_caption_above_media: true,
             reply_markup: replyMarkup,
-            supports_streaming: true
+            supports_streaming: true,
+            width: v.width,
+            height: v.height
         };
 
         try {
@@ -546,25 +522,35 @@ async function sendBestAvailable(chatId, tweet, variants) {
             console.log(`直链请求异常 (${e.message})，准备触发 Worker 中转上传...`);
         }
 
-        // 策略 B: 直链抓取被 Twitter CDN 拒绝时（例如 wrong type of page content），Worker 代理拉取并 Multipart 上传
+        // 策略 B: Worker 中转上传（带浏览器 Header 限速破解 + ArrayBuffer 转 Blob + 显式尺寸标注）
         try {
             console.log(`正在通过 Worker 下载视频流中转上传 (${v.label})...`);
             const dlStart = Date.now();
-            const fileRes = await quickFetch(v.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
+            
+            // 关键点 1: 加上全套 Browser Headers，突破 Twitter CDN 限速降级
+            const fileRes = await quickFetch(v.url, {
+                headers: BROWSER_HEADERS
+            }, CONFIG.DOWNLOAD_TIMEOUT);
+
             if (!fileRes.ok) throw new Error(`HTTP ${fileRes.status}`);
 
-            const blob = await fileRes.blob();
+            // 关键点 2: 使用 ArrayBuffer，构建明确 content-type 的 Blob
+            const buffer = await fileRes.arrayBuffer();
+            const blob = new Blob([buffer], { type: "video/mp4" });
             console.log(`Worker 下载成功 (${(blob.size / 1024 / 1024).toFixed(1)}MB)，耗时: ${Date.now() - dlStart}ms，开始 Multipart 上传...`);
 
             const uploadStart = Date.now();
+            
+            // 关键点 3: 显式指定 width 与 height，强制 Telegram 按正确的视频比例渲染
             const uploadJson = await tgMultipart('sendVideo', {
                 chat_id: chatId,
                 caption: buildCaption(tweet, { variant: v, autoSelected: true }),
                 parse_mode: 'HTML',
                 show_caption_above_media: true,
-                reply_markup: replyMarkup,
-                supports_streaming: true
-            }, 'video', blob, `${tweet.id}_${v.width}x${v.height}.mp4`);
+                supports_streaming: true,
+                width: v.width,
+                height: v.height
+            }, 'video', blob, `${tweet.id}.mp4`);
 
             console.log(`TG Multipart 上传耗时: ${Date.now() - uploadStart}ms`);
             if (uploadJson.ok) {
@@ -619,7 +605,9 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         parse_mode: 'HTML',
         show_caption_above_media: true,
         reply_markup: replyMarkup,
-        supports_streaming: true
+        supports_streaming: true,
+        width: variant.width,
+        height: variant.height
     };
 
     try {
@@ -635,17 +623,23 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 
     // 2. 中转上传尝试
     try {
-        const fileRes = await quickFetch(variant.url, {}, CONFIG.DOWNLOAD_TIMEOUT);
+        const fileRes = await quickFetch(variant.url, {
+            headers: BROWSER_HEADERS
+        }, CONFIG.DOWNLOAD_TIMEOUT);
+
         if (fileRes.ok) {
-            const blob = await fileRes.blob();
+            const buffer = await fileRes.arrayBuffer();
+            const blob = new Blob([buffer], { type: "video/mp4" });
+
             const uploadJson = await tgMultipart('sendVideo', {
                 chat_id: chatId,
                 caption: buildCaption(tweet, { variant, isManual, autoSelected }),
                 parse_mode: 'HTML',
                 show_caption_above_media: true,
-                reply_markup: replyMarkup,
-                supports_streaming: true
-            }, 'video', blob, `${tweetId}_${variant.label}.mp4`);
+                supports_streaming: true,
+                width: variant.width,
+                height: variant.height
+            }, 'video', blob, `${tweetId}.mp4`);
 
             if (uploadJson.ok) {
                 console.log(`✅ Worker 中转上传成功 | ${variant.label}`);
@@ -824,7 +818,6 @@ export default async function handler(req, res) {
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
-            // 规范接住 findBestUnderLimit 的返回值，确保尺寸在内部正确计算与缓存
             const bestVariant = await findBestUnderLimit(baseVariants);
             timer.mark("画质选择完成");
 
@@ -832,7 +825,6 @@ export default async function handler(req, res) {
             const sendSuccess = await sendBestAvailable(chatId, tweet, baseVariants);
 
             if (!sendSuccess) {
-                // 确保准确匹配最高可用档或降级选项
                 const topVariant = bestVariant || baseVariants.find(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) || baseVariants[0];
                 const isSizeUnknown = topVariant.size === 0;
                 const isOverSize = topVariant.size >= CONFIG.BOT_UPLOAD_LIMIT;
