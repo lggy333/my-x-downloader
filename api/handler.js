@@ -16,13 +16,14 @@ const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024, // Telegram Bot API 50MB 上限
     MIN_DISPLAY_HEIGHT: 160,            // 允许 320x426 等竖屏低清流
     HEAD_TIMEOUT: 1500,
-    DOWNLOAD_TIMEOUT: 20000,
+    DOWNLOAD_TIMEOUT: 30000,            // Worker 下载视频超时
+    TG_API_TIMEOUT: 8000,              // 普通 API 操作 8 秒超时
+    TG_UPLOAD_TIMEOUT: 60000,           // 独立大文件上传 60 秒超时
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
     FAIL_SIZE_CACHE_MS: 1 * 60 * 1000,
     MAX_CACHE: 500,
-    HEAD_CONCURRENCY: 4,
-    TG_API_TIMEOUT: 15000
+    HEAD_CONCURRENCY: 4
 };
 
 // ======================
@@ -58,7 +59,7 @@ function escapeHTML(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function quickFetch(url, options = {}, timeoutMs = 3500) {
+async function quickFetch(url, options = {}, timeoutMs = CONFIG.TG_API_TIMEOUT) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -68,6 +69,21 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
     } catch (e) {
         clearTimeout(id);
         throw e;
+    }
+}
+
+/**
+ * 通用异步重试包装器
+ */
+async function retry(fn, times = 2, delayMs = 1000) {
+    for (let i = 0; i < times; i++) {
+        try {
+            return await fn();
+        } catch (e) {
+            if (i === times - 1) throw e;
+            console.log(`[重试] 操作失败: ${e.message}，将在 ${delayMs}ms 后重试第 ${i + 1} 次...`);
+            await new Promise(r => setTimeout(r, delayMs));
+        }
     }
 }
 
@@ -86,7 +102,7 @@ async function tg(method, data, parse = true) {
 }
 
 /**
- * Worker 本地下载文件并通过 Multipart FormData 提交 Telegram
+ * Worker 本地下载文件并通过 Multipart FormData 提交 Telegram (使用独立 60s 超时)
  */
 async function tgMultipart(method, fields, fileField, fileBlob, fileName = "video.mp4") {
     const formData = new FormData();
@@ -105,7 +121,7 @@ async function tgMultipart(method, fields, fileField, fileBlob, fileName = "vide
             method: 'POST',
             body: formData
         },
-        30000 // 文件上传给予 30s 宽裕超时
+        CONFIG.TG_UPLOAD_TIMEOUT // 使用独立的 60s 大文件上传超时
     );
     return await res.json();
 }
@@ -484,12 +500,12 @@ async function sendBestAvailable(chatId, tweet, variants) {
     };
 
     for (const v of variants) {
-        // 1. 过滤超限或未知大小
-        if (v.size > CONFIG.BOT_UPLOAD_LIMIT || v.size === 0) {
+        // 核心修复 1: 解除 v.size === 0 的拦截，仅过滤明确大于 50MB 的视频
+        if (v.size > CONFIG.BOT_UPLOAD_LIMIT) {
             continue;
         }
 
-        // 2. 过滤异常微小极低画质
+        // 过滤异常微小极低画质
         if (v.width < 160 || v.height < 160) {
             console.log(`跳过异常尺寸: ${v.label}`);
             continue;
@@ -522,44 +538,51 @@ async function sendBestAvailable(chatId, tweet, variants) {
             console.log(`直链请求异常 (${e.message})，准备触发 Worker 中转上传...`);
         }
 
-        // 策略 B: Worker 中转上传（带浏览器 Header 限速破解 + ArrayBuffer 转 Blob + 显式尺寸标注）
+        // 策略 B: Worker 中转上传 (Blob 裸流 + 2次重试 + 60s 长超时)
         try {
-            console.log(`正在通过 Worker 下载视频流中转上传 (${v.label})...`);
+            console.log(`正在通过 Worker 下载视频流 (${v.label})...`);
             const dlStart = Date.now();
             
-            // 关键点 1: 加上全套 Browser Headers，突破 Twitter CDN 限速降级
             const fileRes = await quickFetch(v.url, {
                 headers: BROWSER_HEADERS
             }, CONFIG.DOWNLOAD_TIMEOUT);
 
             if (!fileRes.ok) throw new Error(`HTTP ${fileRes.status}`);
 
-            // 关键点 2: 使用 ArrayBuffer，构建明确 content-type 的 Blob
-            const buffer = await fileRes.arrayBuffer();
-            const blob = new Blob([buffer], { type: "video/mp4" });
-            console.log(`Worker 下载成功 (${(blob.size / 1024 / 1024).toFixed(1)}MB)，耗时: ${Date.now() - dlStart}ms，开始 Multipart 上传...`);
+            // 核心修复 2: 不经过 arrayBuffer，直接拿 blob 避免内存二次复制
+            const blob = await fileRes.blob();
+            console.log(`Worker 下载成功 (${(blob.size / 1024 / 1024).toFixed(1)}MB)，耗时: ${Date.now() - dlStart}ms，开始带重试的 Multipart 上传...`);
 
             const uploadStart = Date.now();
             
-            // 关键点 3: 显式指定 width 与 height，强制 Telegram 按正确的视频比例渲染
-            const uploadJson = await tgMultipart('sendVideo', {
-                chat_id: chatId,
-                caption: buildCaption(tweet, { variant: v, autoSelected: true }),
-                parse_mode: 'HTML',
-                show_caption_above_media: true,
-                supports_streaming: true,
-                width: v.width,
-                height: v.height
-            }, 'video', blob, `${tweet.id}.mp4`);
+            // 核心修复 3: 使用 retry 包裹 Multipart 上传，防止 15~30s 瞬态断开
+            const uploadJson = await retry(async () => {
+                return await tgMultipart('sendVideo', {
+                    chat_id: chatId,
+                    caption: buildCaption(tweet, { variant: v, autoSelected: true }),
+                    parse_mode: 'HTML',
+                    show_caption_above_media: true,
+                    supports_streaming: true,
+                    width: v.width,
+                    height: v.height
+                }, 'video', blob, `${tweet.id}.mp4`);
+            }, 2, 1000);
 
-            console.log(`TG Multipart 上传耗时: ${Date.now() - uploadStart}ms`);
+            const uploadCost = Date.now() - uploadStart;
+            // 核心修复 4: 结构化详细日志
+            console.log(`TG Multipart 上传完毕:`, {
+                sizeMB: (blob.size / 1024 / 1024).toFixed(1),
+                costMs: uploadCost,
+                ok: uploadJson.ok,
+                description: uploadJson.description || "Success"
+            });
+
             if (uploadJson.ok) {
                 console.log(`✅ Worker 中转上传成功 | 最终档位: ${v.label}`);
                 return true;
             }
-            console.log(`Worker 中转上传失败: ${uploadJson.description}`);
         } catch (err) {
-            console.error(`Worker 中转上传过程异常: ${err.message}`);
+            console.error(`Worker 中转上传最终失败: ${err.message}`);
         }
     }
 
@@ -581,16 +604,6 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         await tg('sendMessage', {
             chat_id: chatId,
             text: buildCaption(tweet, { variant, isManual, autoSelected, isOverSize: true }),
-            parse_mode: 'HTML',
-            reply_markup: replyMarkup
-        });
-        return;
-    }
-
-    if (variant.size === 0) {
-        await tg('sendMessage', {
-            chat_id: chatId,
-            text: buildCaption(tweet, { variant, isManual, autoSelected, isSizeUnknown: true }),
             parse_mode: 'HTML',
             reply_markup: replyMarkup
         });
@@ -628,18 +641,19 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         }, CONFIG.DOWNLOAD_TIMEOUT);
 
         if (fileRes.ok) {
-            const buffer = await fileRes.arrayBuffer();
-            const blob = new Blob([buffer], { type: "video/mp4" });
+            const blob = await fileRes.blob();
 
-            const uploadJson = await tgMultipart('sendVideo', {
-                chat_id: chatId,
-                caption: buildCaption(tweet, { variant, isManual, autoSelected }),
-                parse_mode: 'HTML',
-                show_caption_above_media: true,
-                supports_streaming: true,
-                width: variant.width,
-                height: variant.height
-            }, 'video', blob, `${tweetId}.mp4`);
+            const uploadJson = await retry(async () => {
+                return await tgMultipart('sendVideo', {
+                    chat_id: chatId,
+                    caption: buildCaption(tweet, { variant, isManual, autoSelected }),
+                    parse_mode: 'HTML',
+                    show_caption_above_media: true,
+                    supports_streaming: true,
+                    width: variant.width,
+                    height: variant.height
+                }, 'video', blob, `${tweetId}.mp4`);
+            }, 2, 1000);
 
             if (uploadJson.ok) {
                 console.log(`✅ Worker 中转上传成功 | ${variant.label}`);
@@ -647,7 +661,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
             }
         }
     } catch (e) {
-        console.error("Worker 中转上传也失败:", e.message);
+        console.error("Worker 中转上传过程异常:", e.message);
     }
 
     // 3. 完全失败降级输出文案
