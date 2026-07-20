@@ -9,7 +9,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,   // Telegram 单文件上传上限 50MB
     MIN_DISPLAY_HEIGHT: 480,              // 最低有效画质高度（过滤极低画质）
-    HEAD_TIMEOUT: 5000,                   // 文件大小探测超时（ms），适配X平台CDN波动
+    HEAD_TIMEOUT: 2500,                   // 文件大小探测超时（ms），适配X平台CDN波动
     DOWNLOAD_TIMEOUT: 20000,               // 视频下载超时（ms）
     TWEET_CACHE_MS: 5 * 60 * 1000,        // 推文数据缓存时长 5分钟
     SIZE_CACHE_MS: 30 * 60 * 1000,        // 文件大小缓存时长 30分钟
@@ -73,6 +73,19 @@ function uniqueQualityVariants(list) {
         }
     }
     return [...map.values()];
+}
+
+/** 展示过滤：大于50MB全部保留，≤50MB仅保留最高清的一个 */
+function prepareDisplayVariants(variants) {
+    let bestUnderLimitFound = false;
+    return variants.filter(v => {
+        if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
+            if (bestUnderLimitFound) return false;
+            bestUnderLimitFound = true;
+            return true;
+        }
+        return true;
+    });
 }
 
 // ======================
@@ -191,10 +204,8 @@ async function getFileSizeInternal(url) {
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
-            // 修复：await 确保 cancel 执行完成，彻底释放连接
-            if (rRes.body) {
-                try { await rRes.body.cancel(); } catch {}
-            }
+            // 主动取消响应体，释放连接，避免CDN挂起
+            rRes.body?.cancel?.();
 
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
@@ -222,21 +233,11 @@ async function getFileSize(url) {
     return await getFileSizeInternal(url);
 }
 
-/**
- * 批量填充画质列表的文件体积（优化版：单任务独立超时，单个坏链不拖整体）
- * 目前查看列表已改用逐级探测，本函数作为备用能力保留
- */
+/** 批量填充画质列表的文件体积 */
 async function fillVariantsSize(variants) {
-    await Promise.all(
-        variants.map(async v => {
-            if (v.size === 0) {
-                v.size = await Promise.race([
-                    getFileSize(v.url),
-                    new Promise(resolve => setTimeout(() => resolve(0), CONFIG.HEAD_TIMEOUT))
-                ]);
-            }
-        })
-    );
+    const tasks = variants.map(v => () => getFileSize(v.url));
+    const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
+    variants.forEach((v, idx) => v.size = sizes[idx]);
     return variants;
 }
 
@@ -435,7 +436,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         }
     } 
     else {
-        await quickFetch(`${TELEGRAM_API}/sendMessage`, {
+        const res = await quickFetch(`${TELEGRAM_API}/sendMessage`, {
             method: 'POST',
             headers: JSON_HEADERS,
             body: JSON.stringify({ 
@@ -445,6 +446,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
                 reply_markup: replyMarkup 
             })
         }, CONFIG.TG_API_TIMEOUT);
+        await res.json();
     }
 }
 
@@ -460,6 +462,7 @@ export default async function handler(req, res) {
         const chatId = callback.message.chat.id;
         const callbackData = callback.data;
 
+        // 回执回调查询
         quickFetch(`${TELEGRAM_API}/answerCallbackQuery`, {
             method: 'POST',
             headers: JSON_HEADERS,
@@ -478,6 +481,7 @@ export default async function handler(req, res) {
             const progressMsgId = progressData.result?.message_id;
 
             if (!progressMsgId) {
+                console.log('[list_q] 发送加载消息失败');
                 return res.status(200).send('OK');
             }
 
@@ -485,47 +489,40 @@ export default async function handler(req, res) {
                 const cacheData = await getTweet(tweetId);
                 const { tweet, baseVariants } = cacheData;
                 if (!tweet || baseVariants.length === 0) {
-                    await quickFetch(`${TELEGRAM_API}/editMessageText`, { 
+                    const editRes = await quickFetch(`${TELEGRAM_API}/editMessageText`, { 
                         method: 'POST', 
                         headers: JSON_HEADERS, 
                         body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: "❌ 未能获取到有效的视频流资料。" }) 
                     }, CONFIG.TG_API_TIMEOUT);
+                    await editRes.json();
                     return res.status(200).send('OK');
                 }
 
-                // 第一步：按分辨率去重，硬限制最多6个档位，避免极端场景探测过多
-                const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
+                // 第一步：按分辨率去重，每个高度只保留最高码率版本
+                const displayVariants = uniqueQualityVariants(baseVariants);
                 console.log(`[list_q] 推文${tweetId} 原始画质${baseVariants.length}个，去重后待检测${displayVariants.length}个`);
 
-                // 第二步：从高到低逐级探测，找到第一个≤50MB立即停止，后续档位不探测
-                console.log(`[list_q] 开始逐级检测文件大小...`);
-                let foundUnderLimit = false;
-                for (const v of displayVariants) {
-                    if (foundUnderLimit) {
-                        v.size = -1; // 标记为无需展示
-                        continue;
-                    }
-                    v.size = await getFileSize(v.url);
-                    if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
-                        foundUnderLimit = true;
-                    }
-                }
-                console.log(`[list_q] 大小检测完成，是否找到可发送档位: ${foundUnderLimit}`);
+                // 第二步：同步探测所有展示档位的体积
+                console.log(`[list_q] 开始检测文件大小...`);
+                await fillVariantsSize(displayVariants);
+                console.log(`[list_q] 大小检测完成`);
                 cacheData.time = Date.now();
 
-                // 第三步：过滤掉标记为无需展示的低清档位
-                const finalVariants = displayVariants.filter(v => v.size !== -1);
+                // 第三步：过滤展示，≤50MB仅保留最高清一个
+                const finalVariants = prepareDisplayVariants(displayVariants);
 
+                // 核心修复：使用数组索引替代完整URL，确保callback_data不超64字节
                 const keyboard = finalVariants.map((v) => {
                     const sizeText = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
-                    const encodedUrl = encodeURIComponent(v.url);
+                    const originalIndex = baseVariants.indexOf(v);
                     return [{
                         text: `${v.label} · ${sizeText}`,
-                        callback_data: `send_q:${tweetId}:${encodedUrl}`
+                        callback_data: `send_q:${tweetId}:${originalIndex}`
                     }];
                 });
 
-                await quickFetch(`${TELEGRAM_API}/editMessageText`, {
+                // 读取响应体，确保请求完整执行并打印结果
+                const editRes = await quickFetch(`${TELEGRAM_API}/editMessageText`, {
                     method: 'POST',
                     headers: JSON_HEADERS,
                     body: JSON.stringify({
@@ -536,30 +533,38 @@ export default async function handler(req, res) {
                         reply_markup: { inline_keyboard: keyboard }
                     })
                 }, CONFIG.TG_API_TIMEOUT);
+                const editResult = await editRes.json();
+                console.log('[list_q] editMessageText结果:', JSON.stringify(editResult));
+
             } catch (err) {
                 console.error(`[list_q] 加载异常:`, err.message);
-                await quickFetch(`${TELEGRAM_API}/editMessageText`, { 
-                    method: 'POST', 
-                    headers: JSON_HEADERS, 
-                    body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 加载发生异常: ${err.message}` }) 
-                }, CONFIG.TG_API_TIMEOUT);
+                try {
+                    const errRes = await quickFetch(`${TELEGRAM_API}/editMessageText`, { 
+                        method: 'POST', 
+                        headers: JSON_HEADERS, 
+                        body: JSON.stringify({ chat_id: chatId, message_id: progressMsgId, text: `❌ 加载发生异常: ${err.message}` }) 
+                    }, CONFIG.TG_API_TIMEOUT);
+                    await errRes.json();
+                } catch {}
             }
             return res.status(200).send('OK');
         }
 
         // 1.2 发送用户选中的指定画质
         if (callbackData.startsWith('send_q:')) {
-            const [, tweetId, encodedUrl] = callbackData.split(':');
-            const targetUrl = decodeURIComponent(encodedUrl);
+            const [, tweetId, indexStr] = callbackData.split(':');
+            const variantIndex = parseInt(indexStr, 10);
 
             try {
                 const cacheData = await getTweet(tweetId);
                 const { tweet, baseVariants } = cacheData;
-                if (!tweet) return res.status(200).send('OK');
+                if (!tweet || !baseVariants[variantIndex]) {
+                    console.error('[send_q] 未找到对应画质');
+                    return res.status(200).send('OK');
+                }
 
-                const chosenVariant = baseVariants.find(v => v.url === targetUrl);
-                if (!chosenVariant) return res.status(200).send('OK');
-
+                const chosenVariant = baseVariants[variantIndex];
+                // 仅探测当前选中档位的体积
                 if (chosenVariant.size === 0) {
                     chosenVariant.size = await getFileSize(chosenVariant.url);
                     cacheData.time = Date.now();
@@ -567,8 +572,10 @@ export default async function handler(req, res) {
 
                 const isOverSize = chosenVariant.size > CONFIG.BOT_UPLOAD_LIMIT;
                 await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true, isOverSize });
+                console.log(`[send_q] 投递完成 画质索引:${variantIndex} 超限:${isOverSize}`);
+
             } catch (e) {
-                console.error('手动投递失败', e.message);
+                console.error('[send_q] 手动投递失败', e.message);
             }
             return res.status(200).send('OK');
         }
@@ -600,7 +607,7 @@ export default async function handler(req, res) {
 • 自动识别图片与纯文本推文
 • 超 50MB 视频提供下载链接`;
 
-        await quickFetch(`${TELEGRAM_API}/sendMessage`, {
+        const res = await quickFetch(`${TELEGRAM_API}/sendMessage`, {
             method: 'POST',
             headers: JSON_HEADERS,
             body: JSON.stringify({
@@ -610,6 +617,7 @@ export default async function handler(req, res) {
                 disable_web_page_preview: true
             })
         }, CONFIG.TG_API_TIMEOUT);
+        await res.json();
         return res.status(200).send('OK');
     }
 
@@ -642,29 +650,32 @@ export default async function handler(req, res) {
             const replyMarkup = { inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]] };
             const caption = buildCaption(tweet);
             if (photos.length === 1) {
-                await quickFetch(`${TELEGRAM_API}/sendPhoto`, {
+                const res = await quickFetch(`${TELEGRAM_API}/sendPhoto`, {
                     method: 'POST',
                     headers: JSON_HEADERS,
                     body: JSON.stringify({ chat_id: chatId, photo: photos[0].url, caption, parse_mode: 'HTML', show_caption_above_media: true, reply_markup: replyMarkup })
                 }, CONFIG.TG_API_TIMEOUT);
+                await res.json();
             } else {
                 const mediaGroup = photos.map((p, idx) => ({
                     type: 'photo', media: p.url, caption: idx === 0 ? caption : '', parse_mode: idx === 0 ? 'HTML' : undefined, show_caption_above_media: idx === 0 ? true : undefined
                 }));
-                await quickFetch(`${TELEGRAM_API}/sendMediaGroup`, {
+                const res = await quickFetch(`${TELEGRAM_API}/sendMediaGroup`, {
                     method: 'POST',
                     headers: JSON_HEADERS,
                     body: JSON.stringify({ chat_id: chatId, media: mediaGroup })
                 }, CONFIG.TG_API_TIMEOUT);
+                await res.json();
             }
         } 
         else {
             const caption = buildCaption(tweet);
-            await quickFetch(`${TELEGRAM_API}/sendMessage`, {
+            const res = await quickFetch(`${TELEGRAM_API}/sendMessage`, {
                 method: 'POST',
                 headers: JSON_HEADERS,
                 body: JSON.stringify({ chat_id: chatId, text: caption, parse_mode: 'HTML' })
             }, CONFIG.TG_API_TIMEOUT);
+            await res.json();
         }
 
     } catch (error) {
