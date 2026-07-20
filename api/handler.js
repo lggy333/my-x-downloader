@@ -8,13 +8,13 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,   // Telegram 单文件上传上限 50MB
-    MIN_DISPLAY_HEIGHT: 480,              // 最低有效画质高度（过滤极低画质）
-    HEAD_TIMEOUT: 2500,                   // 文件大小探测超时（ms），适配X平台CDN波动
+    MIN_DISPLAY_HEIGHT: 240,              // 最低有效画质高度（采集层放宽至240p）
+    HEAD_TIMEOUT: 2500,                   // 文件大小探测超时（ms）
     DOWNLOAD_TIMEOUT: 20000,               // 视频下载超时（ms）
     TWEET_CACHE_MS: 5 * 60 * 1000,        // 推文数据缓存时长 5分钟
     SIZE_CACHE_MS: 30 * 60 * 1000,        // 文件大小缓存时长 30分钟
     MAX_CACHE: 300,                       // LRU 缓存最大条目数
-    HEAD_CONCURRENCY: 4,                   // 体积探测最大并发数，降低限流风险
+    HEAD_CONCURRENCY: 4,                   // 体积探测最大并发数
     URL_SEND_RETRY_DELAY: 200,             // URL 直发失败重试间隔（ms）
     TG_API_TIMEOUT: 5000                   // Telegram API 调用超时（ms）
 };
@@ -64,12 +64,13 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 // ======================
 // 画质列表处理工具
 // ======================
-/** 按分辨率高度去重，同高度保留最高码率版本（需提前排序） */
+/** 按长边分辨率去重，同档位保留最高码率版本（适配横竖屏） */
 function uniqueQualityVariants(list) {
     const map = new Map();
     for (const v of list) {
-        if (!map.has(v.height)) {
-            map.set(v.height, v);
+        const quality = Math.max(v.width, v.height);
+        if (!map.has(quality)) {
+            map.set(quality, v);
         }
     }
     return [...map.values()];
@@ -336,6 +337,7 @@ function collectVideoVariants(media = {}) {
     const parsedList = [];
     rawItems.forEach(item => {
         if (!item || !item.url) return;
+        // 按类型过滤，排除非视频/非HLS流
         if (item.content_type && !item.content_type.includes("video") && !item.content_type.includes("mpegURL")) return;
         if (item.container && item.container !== "mp4" && item.container !== "m3u8") return;
 
@@ -346,9 +348,9 @@ function collectVideoVariants(media = {}) {
 
     const deduped = dedupeVariants(parsedList);
 
+    // 过滤规则：移除HLS、无效分辨率、超宽高、低于最低画质阈值
     return deduped.filter(v => {
         if (v.isHLS) return false;
-        if (!v.url.endsWith('.mp4') && !v.url.includes('.mp4?')) return false;
         if (v.width <= 0 || v.height <= 0) return false;
         if (v.width > 7680 || v.height > 7680) return false;
         if (v.height < CONFIG.MIN_DISPLAY_HEIGHT) return false;
@@ -498,7 +500,7 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 第一步：按分辨率去重，每个高度只保留最高码率版本
+                // 第一步：按长边分辨率去重，每个档位只保留最高码率版本
                 const displayVariants = uniqueQualityVariants(baseVariants);
                 console.log(`[list_q] 推文${tweetId} 原始画质${baseVariants.length}个，去重后待检测${displayVariants.length}个`);
 
@@ -511,7 +513,7 @@ export default async function handler(req, res) {
                 // 第三步：过滤展示，≤50MB仅保留最高清一个
                 const finalVariants = prepareDisplayVariants(displayVariants);
 
-                // 核心修复：使用数组索引替代完整URL，确保callback_data不超64字节
+                // 使用数组索引替代完整URL，确保callback_data不超64字节
                 const keyboard = finalVariants.map((v) => {
                     const sizeText = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
                     const originalIndex = baseVariants.indexOf(v);
