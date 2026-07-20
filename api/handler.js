@@ -2,30 +2,27 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-// 常规浏览器 User-Agent 模拟，保证 Twitter CDN 兼容性
 const BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
     "Accept-Encoding": "identity"
 };
 
-// ======================
-// 全局功能配置
-// ======================
 const CONFIG = {
-    BOT_UPLOAD_LIMIT: 45 * 1024 * 1024, // 45MB，安全防线
+    BOT_UPLOAD_LIMIT: 45 * 1024 * 1024,
     MIN_DISPLAY_HEIGHT: 160,
     HEAD_TIMEOUT: 2000,
-    DOWNLOAD_TIMEOUT: 35000,            // Worker 下载超时
+    DOWNLOAD_TIMEOUT: 35000,
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
+    FAIL_CACHE_MS: 10 * 60 * 1000,      // CDN 直传失败短路缓存时间（10分钟）
     MAX_CACHE: 500,
     HEAD_CONCURRENCY: 4,
-    TG_API_TIMEOUT: 5000                // 普通轻量 API 超时
+    TG_API_TIMEOUT: 5000
 };
 
 // ======================
-// 性能监控计时器 (Profiler)
+// 性能监控与直传失败缓存
 // ======================
 function createTimer(label) {
     const start = Date.now();
@@ -39,13 +36,40 @@ function createTimer(label) {
     };
 }
 
-// 帮助获取当前 Node 内存使用（MB）
 function getMemoryUsageMB() {
     if (typeof process !== 'undefined' && process.memoryUsage) {
         const mem = process.memoryUsage();
         return `RSS: ${(mem.rss / 1024 / 1024).toFixed(1)}MB, Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`;
     }
     return 'N/A';
+}
+
+// 记录抓取失败的 Host/Domain，实现短路优化
+const directFailCache = new Map();
+
+function getUrlHost(urlString) {
+    try {
+        return new URL(urlString).hostname;
+    } catch {
+        return urlString;
+    }
+}
+
+function isDirectFailed(url) {
+    const host = getUrlHost(url);
+    const expireTime = directFailCache.get(host);
+    if (!expireTime) return false;
+    if (Date.now() > expireTime) {
+        directFailCache.delete(host);
+        return false;
+    }
+    return true;
+}
+
+function markDirectFailed(url) {
+    const host = getUrlHost(url);
+    cacheSet(directFailCache, host, Date.now() + CONFIG.FAIL_CACHE_MS);
+    console.log(`⚠️ [FailCache] 域名 ${host} 直传失败，已加入短路黑名单 (10 分钟)`);
 }
 
 // ======================
@@ -87,9 +111,6 @@ async function tg(method, data, parse = true) {
     return await res.json();
 }
 
-/**
- * 大文件 Multipart 上传：无 AbortController 截断
- */
 async function tgMultipart(method, fields, fileField, fileBlob, fileName = "video.mp4") {
     const formData = new FormData();
     for (const [k, v] of Object.entries(fields)) {
@@ -127,18 +148,25 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 }
 
 // ======================
-// 画质列表处理工具
+// 画质去重与展示（修复重复分辨率问题）
 // ======================
-function uniqueQualityVariants(list) {
+/**
+ * 核心优化：只以 width x height 为唯一判定标准，自动保留该分辨率下最高 Bitrate 的视频
+ */
+function dedupeVariants(list) {
     const map = new Map();
     for (const v of list) {
-        const quality = Math.max(v.width, v.height);
-        const old = map.get(quality);
-        if (!old || v.bitrate > old.bitrate) {
-            map.set(quality, v);
+        const key = `${v.width}x${v.height}`;
+        const existing = map.get(key);
+        if (!existing || v.bitrate > existing.bitrate) {
+            map.set(key, v);
         }
     }
-    return [...map.values()].sort(compareVariant);
+    return [...map.values()];
+}
+
+function uniqueQualityVariants(list) {
+    return dedupeVariants(list).sort(compareVariant);
 }
 
 function prepareDisplayVariants(variants) {
@@ -202,7 +230,7 @@ function cacheSet(cache, key, value) {
 }
 
 // ======================
-// 推文数据获取与缓存 (带计时)
+// 推文数据获取与缓存
 // ======================
 const tweetCache = new Map();
 const tweetPending = new Map();
@@ -246,7 +274,7 @@ async function getTweet(tweetId) {
 
     tweetPending.set(tweetId, requestPromise);
     const result = await requestPromise;
-    timer.end(`解析完成, 找到 ${result.baseVariants.length} 个视频流`);
+    timer.end(`解析完成, 找到 ${result.baseVariants.length} 个不重复分辨率视频流`);
     return result;
 }
 
@@ -312,7 +340,7 @@ async function getFileSize(url) {
 }
 
 async function fillVariantsSize(variants) {
-    const timer = createTimer(`fillVariantsSize [${variants.length}个画质并发探测]`);
+    const timer = createTimer(`fillVariantsSize [${variants.length}个画质探测]`);
     const tasks = variants.map(v => () => getFileSize(v.url));
     const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
     variants.forEach((v, idx) => v.size = sizes[idx]);
@@ -325,21 +353,6 @@ async function fillVariantsSize(variants) {
 // ======================
 function normalizeVideoUrl(url) {
     return url.trim();
-}
-
-function dedupeVariants(list) {
-    const map = new Map();
-    for (const v of list) {
-        const key = `${v.width}x${v.height}_${v.bitrate}`;
-        if (!map.has(key)) {
-            map.set(key, v);
-            continue;
-        }
-        if (v.bitrate > map.get(key).bitrate) {
-            map.set(key, v);
-        }
-    }
-    return [...map.values()];
 }
 
 function compareVariant(a, b) {
@@ -434,7 +447,7 @@ async function findBestUnderLimit(variants) {
 }
 
 // ======================
-// 核心发送逻辑 (全链路耗时监控)
+// 核心发送逻辑 (带直传失败短路)
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const totalTimer = createTimer(`sendSpecificVideo [${variant.label}]`);
@@ -444,7 +457,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]]
     };
 
-    // 1. 超大视频：退化显示
+    // 1. 超大视频退化
     if (variant.size > CONFIG.BOT_UPLOAD_LIMIT) {
         await tg('sendMessage', {
             chat_id: chatId,
@@ -458,36 +471,43 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 
     const caption = buildCaption(tweet, { variant, isManual, autoSelected });
 
-    // 2. TG URL 直传
-    const tgDirectTimer = createTimer(`TG URL Direct Upload [${variant.label}]`);
-    try {
-        const json = await tg('sendVideo', {
-            chat_id: chatId,
-            video: variant.url,
-            caption,
-            parse_mode: 'HTML',
-            show_caption_above_media: true,
-            reply_markup: replyMarkup,
-            supports_streaming: true,
-            width: variant.width,
-            height: variant.height,
-            disable_content_type_detection: true
-        });
+    // 2. 尝试 TG URL 直传 (含失败短路检查)
+    if (!isDirectFailed(variant.url)) {
+        const tgDirectTimer = createTimer(`TG URL Direct Upload [${variant.label}]`);
+        try {
+            const json = await tg('sendVideo', {
+                chat_id: chatId,
+                video: variant.url,
+                caption,
+                parse_mode: 'HTML',
+                show_caption_above_media: true,
+                reply_markup: replyMarkup,
+                supports_streaming: true,
+                width: variant.width,
+                height: variant.height,
+                disable_content_type_detection: true
+            });
 
-        if (json.ok) {
-            tgDirectTimer.end('直传成功 🎉');
-            totalTimer.end('总发送完成 (URL 直传通道)');
-            return;
+            if (json.ok) {
+                tgDirectTimer.end('直传成功 🎉');
+                totalTimer.end('总发送完成 (URL 直传通道)');
+                return;
+            }
+            
+            tgDirectTimer.end(`直传被拒: ${json.description}`);
+            markDirectFailed(variant.url); // 标记 Host 失败
+        } catch (e) {
+            tgDirectTimer.end(`直传网络异常: ${e.message}`);
+            markDirectFailed(variant.url);
         }
-        tgDirectTimer.end(`直传被拒: ${json.description}`);
-    } catch (e) {
-        tgDirectTimer.end(`直传网络异常: ${e.message}`);
+    } else {
+        console.log(`⏩ [ShortCircuit] 域名 ${getUrlHost(variant.url)} 处于直传黑名单中，跳过直传，直接走 Worker 中转`);
     }
 
     // 3. Worker 中转下载与 Multipart 上传
-    console.log(`⚠️ 进入降级中转模式... 当前内存: ${getMemoryUsageMB()}`);
+    console.log(`⚠️ 进入中转模式... 当前内存: ${getMemoryUsageMB()}`);
     
-    // 3.1 下载阶段
+    // 3.1 下载
     const downloadTimer = createTimer(`Worker Download Video`);
     let blob;
     try {
@@ -508,7 +528,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         return;
     }
 
-    // 3.2 上传阶段
+    // 3.2 上传
     const uploadTimer = createTimer(`TG Multipart Upload`);
     try {
         const uploadJson = await tgMultipart('sendVideo', {
@@ -533,7 +553,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         uploadTimer.end(`上传网络异常: ${err.message}`);
     }
 
-    // 4. 彻底失败兜底
+    // 4. 兜底
     await tg('sendMessage', {
         chat_id: chatId,
         text: buildCaption(tweet, { variant, isManual, autoSelected, isOverSize: true }),
@@ -550,7 +570,6 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
     const reqTimer = createTimer('Full Serverless Request Lifetime');
 
-    // ---------- 1. 回调按钮事件 ----------
     if (req.body.callback_query) {
         const callback = req.body.callback_query;
         const chatId = callback.message.chat.id;
@@ -558,14 +577,13 @@ export default async function handler(req, res) {
 
         tg('answerCallbackQuery', { callback_query_id: callback.id }, false).catch(() => {});
 
-        // 1.1 查看所有画质列表
         if (callbackData.startsWith('list_q:')) {
             const tweetId = callbackData.split(':')[1];
             const progressData = await tg('sendMessage', { chat_id: chatId, text: "🔍 正在加载画质列表..." });
             const progressMsgId = progressData.result?.message_id;
 
             if (!progressMsgId) {
-                reqTimer.end('Callback list_q: 进度条消息发送失败');
+                reqTimer.end('Callback list_q: 进度条发送失败');
                 return res.status(200).send('OK');
             }
 
@@ -618,7 +636,6 @@ export default async function handler(req, res) {
             return res.status(200).send('OK');
         }
 
-        // 1.2 发送指定画质
         if (callbackData.startsWith('send_q:')) {
             const [, tweetId, indexStr] = callbackData.split(':');
             const variantIndex = parseInt(indexStr, 10);
@@ -644,7 +661,6 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
     }
 
-    // ---------- 2. 普通消息处理 ----------
     const msg = req.body.message || req.body.channel_post;
     if (!msg || !msg.text) {
         reqTimer.end('非文本消息，略过');
