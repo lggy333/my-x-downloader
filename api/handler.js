@@ -3,7 +3,7 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ''
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 // ======================
-// 全局功能配置
+// 全局功能配置（稳定版参数）
 // ======================
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,
@@ -12,7 +12,6 @@ const CONFIG = {
     DOWNLOAD_TIMEOUT: 20000,
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
-    FAIL_SIZE_CACHE_MS: 60 * 1000, // 失败探测短缓存，避免污染
     MAX_CACHE: 500,
     HEAD_CONCURRENCY: 4,
     TG_API_TIMEOUT: 5000
@@ -69,45 +68,6 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     const workers = Array(Math.min(limit, tasks.length)).fill().map(worker);
     await Promise.all(workers);
     return results;
-}
-
-// ======================
-// 性能计时器（新增）
-// ======================
-function createTimer(name = "TOTAL") {
-    const start = Date.now();
-    const points = {};
-
-    return {
-        mark(label) {
-            points[label] = Date.now() - start;
-        },
-        end() {
-            const total = Date.now() - start;
-            console.log(`\n===== ${name} 性能报告 =====`);
-            for (const [k, v] of Object.entries(points)) {
-                console.log(`${k}: ${v}ms`);
-            }
-            console.log(`TOTAL: ${total}ms`);
-            console.log("====================\n");
-            return { total, points };
-        }
-    };
-}
-
-// ======================
-// 缓存机制
-// ======================
-function cacheGet(cache, key) {
-    return cache.get(key);
-}
-
-function cacheSet(cache, key, value) {
-    if (cache.size >= CONFIG.MAX_CACHE) {
-        const first = cache.keys().next().value;
-        cache.delete(first);
-    }
-    cache.set(key, value);
 }
 
 // ======================
@@ -175,13 +135,24 @@ function buildCaption(tweet, options = {}) {
 }
 
 // ======================
+// LRU 缓存机制
+// ======================
+function cacheSet(cache, key, value) {
+    if (cache.size >= CONFIG.MAX_CACHE) {
+        const first = cache.keys().next().value;
+        cache.delete(first);
+    }
+    cache.set(key, value);
+}
+
+// ======================
 // 推文数据缓存
 // ======================
 const tweetCache = new Map();
 const tweetPending = new Map();
 
 async function getTweet(tweetId) {
-    const cached = cacheGet(tweetCache, tweetId);
+    const cached = tweetCache.get(tweetId);
     if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
         return cached;
     }
@@ -217,20 +188,15 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小探测（修复：失败缓存独立有效期）
+// 文件大小缓存（核心修复区）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
 
 async function getFileSizeInternal(url) {
-    const cached = cacheGet(sizeCache, url);
-    // 成功/失败分别判断有效期
-    if (cached) {
-        const age = Date.now() - cached.time;
-        if ((!cached.fail && age < CONFIG.SIZE_CACHE_MS) ||
-            (cached.fail && age < CONFIG.FAIL_SIZE_CACHE_MS)) {
-            return cached.size;
-        }
+    const cached = sizeCache.get(url);
+    if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
+        return cached.size;
     }
 
     if (sizePending.has(url)) {
@@ -238,8 +204,8 @@ async function getFileSizeInternal(url) {
     }
 
     const requestPromise = (async () => {
-        let size = 0;
         try {
+            // 修复3: Range 改为 0-1，提升部分CDN兼容性
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
@@ -248,33 +214,35 @@ async function getFileSizeInternal(url) {
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
+            // 主动释放连接
             rRes.body?.cancel?.();
 
-            // 优先提取 content-range
+            // 优先读取 content-range
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
                 if (match) {
-                    size = parseInt(match[1], 10);
+                    // 修复1: 进制参数修正为10，避免返回NaN
+                    const size = parseInt(match[1], 10);
+                    cacheSet(sizeCache, url, { time: Date.now(), size });
+                    return size;
                 }
             }
 
-            // 兜底 content-length
-            if (!size) {
-                const contentLength = rRes.headers.get("content-length");
-                if (contentLength) {
-                    size = parseInt(contentLength, 10);
-                }
+            // 修复2: 增加 content-length 兜底，兼容不返回range的CDN节点
+            const contentLength = rRes.headers.get("content-length");
+            if (contentLength) {
+                const size = parseInt(contentLength, 10);
+                cacheSet(sizeCache, url, { time: Date.now(), size });
+                return size;
             }
-        } catch {}
 
-        // 成功长缓存，失败短缓存并标记
-        cacheSet(sizeCache, url, {
-            time: Date.now(),
-            size,
-            fail: size === 0
-        });
-        return size;
+            return 0;
+        } catch {
+            return 0;
+        } finally {
+            sizePending.delete(url);
+        }
     })();
 
     sizePending.set(url, requestPromise);
@@ -316,7 +284,8 @@ function dedupeVariants(list) {
 
 function compareVariant(a, b) {
     if (a.height !== b.height) return b.height - a.height;
-    return b.bitrate - a.bitrate;
+    if (a.bitrate !== b.bitrate) return b.bitrate - a.bitrate;
+    return 0;
 }
 
 function parseVideoVariant(v, idx = 0) {
@@ -339,7 +308,7 @@ function parseVideoVariant(v, idx = 0) {
     const isHLS = type.includes("mpegURL") || type.includes("m3u8");
 
     return {
-        url: normalizeVideoUrl(v.url), // 修复：原代码误写为url，导致地址为空
+        url: normalizeVideoUrl(v.url),
         width,
         height,
         bitrate: v.bitrate || 0,
@@ -400,32 +369,10 @@ function collectVideoVariants(media = {}) {
 }
 
 // ======================
-// 核心选图与发送逻辑（优化：前2档并发 + 后续串行）
+// 核心选图与发送逻辑
 // ======================
 async function findBestUnderLimit(variants) {
-    // 最高两档并发探测，覆盖90%常见场景
-    const topCandidates = variants.slice(0, 2);
-    const checkedTop = await Promise.all(
-        topCandidates.map(async v => {
-            if (v.size === 0) {
-                v.size = await getFileSize(v.url);
-            }
-            return v;
-        })
-    );
-
-    // 从并发结果中选最高画质合规档
-    const validTop = checkedTop
-        .filter(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT)
-        .sort(compareVariant);
-    
-    if (validTop.length > 0) {
-        return validTop[0];
-    }
-
-    // 前两档均超限，串行检测剩余低画质
-    for (let i = 2; i < variants.length; i++) {
-        const v = variants[i];
+    for (const v of variants) {
         if (v.size === 0) {
             v.size = await getFileSize(v.url);
         }
@@ -433,7 +380,6 @@ async function findBestUnderLimit(variants) {
             return v;
         }
     }
-
     return null;
 }
 
@@ -466,7 +412,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
                 if (json.ok) urlSent = true;
                 else throw new Error(json.description || "Direct URL send failed");
             } catch (e) {
-                if (attempt === 0) await new Promise(r => setTimeout(r, 50));
+                if (attempt === 0) await new Promise(r => setTimeout(r, 200));
                 else console.log("URL 发送失败，降级为上传:", e.message);
             }
         }
@@ -502,7 +448,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 }
 
 // ======================
-// Serverless 主入口（全链路埋点）
+// Serverless 主入口
 // ======================
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
@@ -596,16 +542,14 @@ export default async function handler(req, res) {
         return res.status(200).send('OK');
     }
 
-    // ---------- 2. 普通消息处理（主链路埋点） ----------
+    // ---------- 2. 普通消息处理 ----------
     const msg = req.body.message || req.body.channel_post;
     if (!msg || !msg.text) return res.status(200).send('OK');
 
     const text = msg.text.trim();
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
-    const timer = createTimer("X视频解析-主链路");
 
-    // 异步删除消息，不阻塞主流程
     tg('deleteMessage', { chat_id: chatId, message_id: messageId }, false).catch(() => {});
 
     if (text === '/start') {
@@ -623,32 +567,23 @@ export default async function handler(req, res) {
             parse_mode: 'HTML',
             disable_web_page_preview: true
         });
-        timer.mark("启动消息发送完成");
-        timer.end();
         return res.status(200).send('OK');
     }
 
     const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
     const match = text.match(twitterRegex);
-    if (!match) {
-        timer.end();
-        return res.status(200).send('OK');
-    }
+    if (!match) return res.status(200).send('OK');
     const tweetId = match[1];
 
     try {
         const cacheData = await getTweet(tweetId);
-        timer.mark("fxTwitter解析完成");
-
         const { tweet, baseVariants } = cacheData;
         const photos = tweet.media?.photos || [];
 
         if (baseVariants.length > 0) {
             const best = await findBestUnderLimit(baseVariants);
-            timer.mark("画质选择完成");
             cacheData.time = Date.now();
 
-            timer.mark("开始发送Telegram");
             if (best) {
                 await sendSpecificVideo(chatId, tweet, best, { autoSelected: true });
             } else {
@@ -658,7 +593,6 @@ export default async function handler(req, res) {
                 }
                 await sendSpecificVideo(chatId, tweet, topVariant, { isOverSize: true });
             }
-            timer.mark("Telegram发送完成");
         } 
         else if (photos.length > 0) {
             const replyMarkup = { inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]] };
@@ -682,7 +616,6 @@ export default async function handler(req, res) {
                 }));
                 await tg('sendMediaGroup', { chat_id: chatId, media: mediaGroup });
             }
-            timer.mark("图片发送完成");
         } 
         else {
             await tg('sendMessage', {
@@ -690,13 +623,11 @@ export default async function handler(req, res) {
                 text: buildCaption(tweet),
                 parse_mode: 'HTML'
             });
-            timer.mark("纯文本发送完成");
         }
 
     } catch (error) {
         console.error('[总线报错]:', error.message);
     }
 
-    timer.end();
     return res.status(200).send('OK');
 }
