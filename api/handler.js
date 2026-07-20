@@ -38,7 +38,6 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
     }
 }
 
-// 优化：Telegram API统一封装，支持跳过JSON解析，减少非关键请求延迟
 async function tg(method, data, parse = true) {
     const res = await quickFetch(
         `${TELEGRAM_API}/${method}`,
@@ -74,7 +73,6 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 // ======================
 // 画质列表处理工具
 // ======================
-// 同分辨率保留最高码率，返回前强制排序，不受源数据顺序影响
 function uniqueQualityVariants(list) {
     const map = new Map();
     for (const v of list) {
@@ -87,7 +85,6 @@ function uniqueQualityVariants(list) {
     return [...map.values()].sort(compareVariant);
 }
 
-// 展示过滤：大于50MB全部保留，≤50MB仅保留最高清的一个
 function prepareDisplayVariants(variants) {
     let bestUnderLimitFound = false;
     return variants.filter(v => {
@@ -119,7 +116,6 @@ function buildCaption(tweet, options = {}) {
     
     if (isOverSize && variant) {
         const sizeMB = variant.size > 0 ? `${(variant.size / (1024 * 1024)).toFixed(1)} MB` : '未知';
-        // 优化：超长URL不直接渲染，避免Telegram HTML解析异常
         if (variant.url.length > 300) {
             lines.push(`⚠️ 该画质过大 (${sizeMB}MB) 无法直接发送\n🚀 高清原片链接过长，请通过画质按钮选择下载`);
         } else {
@@ -192,7 +188,7 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存
+// 文件大小缓存（核心修复区）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
@@ -209,25 +205,38 @@ async function getFileSizeInternal(url) {
 
     const requestPromise = (async () => {
         try {
+            // 修复3: Range 改为 0-1，提升部分CDN兼容性
             const rRes = await quickFetch(url, {
                 method: "GET",
                 headers: {
-                    "Range": "bytes=0-0",
+                    "Range": "bytes=0-1",
                     "Accept-Encoding": "identity"
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
+            // 主动释放连接
             rRes.body?.cancel?.();
 
+            // 优先读取 content-range
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
                 const match = contentRange.match(/\/(\d+)$/);
                 if (match) {
-                    const size = parseInt(match[1], 1);
+                    // 修复1: 进制参数修正为10，避免返回NaN
+                    const size = parseInt(match[1], 10);
                     cacheSet(sizeCache, url, { time: Date.now(), size });
                     return size;
                 }
             }
+
+            // 修复2: 增加 content-length 兜底，兼容不返回range的CDN节点
+            const contentLength = rRes.headers.get("content-length");
+            if (contentLength) {
+                const size = parseInt(contentLength, 10);
+                cacheSet(sizeCache, url, { time: Date.now(), size });
+                return size;
+            }
+
             return 0;
         } catch {
             return 0;
@@ -362,7 +371,6 @@ function collectVideoVariants(media = {}) {
 // ======================
 // 核心选图与发送逻辑
 // ======================
-// 核心修复：改回串行逐个探测，找到合规档立即返回，消除并发等待波动
 async function findBestUnderLimit(variants) {
     for (const v of variants) {
         if (v.size === 0) {
@@ -451,7 +459,6 @@ export default async function handler(req, res) {
         const chatId = callback.message.chat.id;
         const callbackData = callback.data;
 
-        // 非关键请求跳过JSON解析，减少延迟
         tg('answerCallbackQuery', { callback_query_id: callback.id }, false).catch(() => {});
 
         // 1.1 查看所有画质列表
@@ -476,10 +483,8 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 优化：去重后最多保留6档，覆盖4K到240p全档位，避免极端情况拖慢
                 const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
                 await fillVariantsSize(displayVariants);
-                // 不刷新tweet缓存生命周期，避免热门推文永久驻留积累旧数据
 
                 const finalVariants = prepareDisplayVariants(displayVariants);
                 const keyboard = finalVariants.map((v) => {
@@ -545,7 +550,6 @@ export default async function handler(req, res) {
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
-    // 非关键请求跳过JSON解析
     tg('deleteMessage', { chat_id: chatId, message_id: messageId }, false).catch(() => {});
 
     if (text === '/start') {
