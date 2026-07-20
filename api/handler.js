@@ -15,14 +15,13 @@ const CONFIG = {
     DOWNLOAD_TIMEOUT: 35000,
     TWEET_CACHE_MS: 10 * 60 * 1000,
     SIZE_CACHE_MS: 30 * 60 * 1000,
-    FAIL_CACHE_MS: 10 * 60 * 1000,      // CDN 直传失败短路缓存时间（10分钟）
     MAX_CACHE: 500,
     HEAD_CONCURRENCY: 4,
     TG_API_TIMEOUT: 5000
 };
 
 // ======================
-// 性能监控与直传失败缓存
+// 性能监控与分析 (Profiler)
 // ======================
 function createTimer(label) {
     const start = Date.now();
@@ -42,34 +41,6 @@ function getMemoryUsageMB() {
         return `RSS: ${(mem.rss / 1024 / 1024).toFixed(1)}MB, Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`;
     }
     return 'N/A';
-}
-
-// 记录抓取失败的 Host/Domain，实现短路优化
-const directFailCache = new Map();
-
-function getUrlHost(urlString) {
-    try {
-        return new URL(urlString).hostname;
-    } catch {
-        return urlString;
-    }
-}
-
-function isDirectFailed(url) {
-    const host = getUrlHost(url);
-    const expireTime = directFailCache.get(host);
-    if (!expireTime) return false;
-    if (Date.now() > expireTime) {
-        directFailCache.delete(host);
-        return false;
-    }
-    return true;
-}
-
-function markDirectFailed(url) {
-    const host = getUrlHost(url);
-    cacheSet(directFailCache, host, Date.now() + CONFIG.FAIL_CACHE_MS);
-    console.log(`⚠️ [FailCache] 域名 ${host} 直传失败，已加入短路黑名单 (10 分钟)`);
 }
 
 // ======================
@@ -148,11 +119,8 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
 }
 
 // ======================
-// 画质去重与展示（修复重复分辨率问题）
+// 画质去重与展示（严格按分辨率唯一化）
 // ======================
-/**
- * 核心优化：只以 width x height 为唯一判定标准，自动保留该分辨率下最高 Bitrate 的视频
- */
 function dedupeVariants(list) {
     const map = new Map();
     for (const v of list) {
@@ -274,7 +242,7 @@ async function getTweet(tweetId) {
 
     tweetPending.set(tweetId, requestPromise);
     const result = await requestPromise;
-    timer.end(`解析完成, 找到 ${result.baseVariants.length} 个不重复分辨率视频流`);
+    timer.end(`解析完成, 找到 ${result.baseVariants.length} 个唯一分辨率视频流`);
     return result;
 }
 
@@ -447,7 +415,7 @@ async function findBestUnderLimit(variants) {
 }
 
 // ======================
-// 核心发送逻辑 (带直传失败短路)
+// 核心发送逻辑 (纯粹的直传优先 + Worker 兜底)
 // ======================
 async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
     const totalTimer = createTimer(`sendSpecificVideo [${variant.label}]`);
@@ -471,43 +439,36 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
 
     const caption = buildCaption(tweet, { variant, isManual, autoSelected });
 
-    // 2. 尝试 TG URL 直传 (含失败短路检查)
-    if (!isDirectFailed(variant.url)) {
-        const tgDirectTimer = createTimer(`TG URL Direct Upload [${variant.label}]`);
-        try {
-            const json = await tg('sendVideo', {
-                chat_id: chatId,
-                video: variant.url,
-                caption,
-                parse_mode: 'HTML',
-                show_caption_above_media: true,
-                reply_markup: replyMarkup,
-                supports_streaming: true,
-                width: variant.width,
-                height: variant.height,
-                disable_content_type_detection: true
-            });
+    // 2. 永远优先尝试一次 TG URL 直传
+    const tgDirectTimer = createTimer(`TG URL Direct Upload [${variant.label}]`);
+    try {
+        const json = await tg('sendVideo', {
+            chat_id: chatId,
+            video: variant.url,
+            caption,
+            parse_mode: 'HTML',
+            show_caption_above_media: true,
+            reply_markup: replyMarkup,
+            supports_streaming: true,
+            width: variant.width,
+            height: variant.height,
+            disable_content_type_detection: true
+        });
 
-            if (json.ok) {
-                tgDirectTimer.end('直传成功 🎉');
-                totalTimer.end('总发送完成 (URL 直传通道)');
-                return;
-            }
-            
-            tgDirectTimer.end(`直传被拒: ${json.description}`);
-            markDirectFailed(variant.url); // 标记 Host 失败
-        } catch (e) {
-            tgDirectTimer.end(`直传网络异常: ${e.message}`);
-            markDirectFailed(variant.url);
+        if (json.ok) {
+            tgDirectTimer.end('直传成功 🎉');
+            totalTimer.end('总发送完成 (URL 直传通道)');
+            return;
         }
-    } else {
-        console.log(`⏩ [ShortCircuit] 域名 ${getUrlHost(variant.url)} 处于直传黑名单中，跳过直传，直接走 Worker 中转`);
+        tgDirectTimer.end(`直传被拒: ${json.description}`);
+    } catch (e) {
+        tgDirectTimer.end(`直传网络异常: ${e.message}`);
     }
 
-    // 3. Worker 中转下载与 Multipart 上传
-    console.log(`⚠️ 进入中转模式... 当前内存: ${getMemoryUsageMB()}`);
+    // 3. 直传失败，立刻平滑进入 Worker 中转通道
+    console.log(`⚠️ 进入降级中转模式... 当前内存: ${getMemoryUsageMB()}`);
     
-    // 3.1 下载
+    // 3.1 下载阶段
     const downloadTimer = createTimer(`Worker Download Video`);
     let blob;
     try {
@@ -528,7 +489,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         return;
     }
 
-    // 3.2 上传
+    // 3.2 上传阶段
     const uploadTimer = createTimer(`TG Multipart Upload`);
     try {
         const uploadJson = await tgMultipart('sendVideo', {
@@ -553,7 +514,7 @@ async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
         uploadTimer.end(`上传网络异常: ${err.message}`);
     }
 
-    // 4. 兜底
+    // 4. 最终兜底
     await tg('sendMessage', {
         chat_id: chatId,
         text: buildCaption(tweet, { variant, isManual, autoSelected, isOverSize: true }),
