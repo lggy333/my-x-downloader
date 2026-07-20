@@ -9,7 +9,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,   // Telegram 单文件上传上限 50MB
     MIN_DISPLAY_HEIGHT: 480,              // 最低有效画质高度（过滤极低画质）
-    HEAD_TIMEOUT: 2500,                   // 文件大小探测超时（ms），适配X平台CDN波动
+    HEAD_TIMEOUT: 5000,                   // 文件大小探测超时（ms），适配X平台CDN波动
     DOWNLOAD_TIMEOUT: 20000,               // 视频下载超时（ms）
     TWEET_CACHE_MS: 5 * 60 * 1000,        // 推文数据缓存时长 5分钟
     SIZE_CACHE_MS: 30 * 60 * 1000,        // 文件大小缓存时长 30分钟
@@ -73,19 +73,6 @@ function uniqueQualityVariants(list) {
         }
     }
     return [...map.values()];
-}
-
-/** 展示过滤：大于50MB全部保留，≤50MB仅保留最高清的一个 */
-function prepareDisplayVariants(variants) {
-    let bestUnderLimitFound = false;
-    return variants.filter(v => {
-        if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
-            if (bestUnderLimitFound) return false;
-            bestUnderLimitFound = true;
-            return true;
-        }
-        return true;
-    });
 }
 
 // ======================
@@ -204,8 +191,10 @@ async function getFileSizeInternal(url) {
                 }
             }, CONFIG.HEAD_TIMEOUT);
 
-            // 关键修复：主动取消响应体，释放连接，避免CDN挂起
-            rRes.body?.cancel?.();
+            // 修复：await 确保 cancel 执行完成，彻底释放连接
+            if (rRes.body) {
+                try { await rRes.body.cancel(); } catch {}
+            }
 
             const contentRange = rRes.headers.get("content-range");
             if (contentRange) {
@@ -233,11 +222,21 @@ async function getFileSize(url) {
     return await getFileSizeInternal(url);
 }
 
-/** 批量填充画质列表的文件体积 */
+/**
+ * 批量填充画质列表的文件体积（优化版：单任务独立超时，单个坏链不拖整体）
+ * 目前查看列表已改用逐级探测，本函数作为备用能力保留
+ */
 async function fillVariantsSize(variants) {
-    const tasks = variants.map(v => () => getFileSize(v.url));
-    const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
-    variants.forEach((v, idx) => v.size = sizes[idx]);
+    await Promise.all(
+        variants.map(async v => {
+            if (v.size === 0) {
+                v.size = await Promise.race([
+                    getFileSize(v.url),
+                    new Promise(resolve => setTimeout(() => resolve(0), CONFIG.HEAD_TIMEOUT))
+                ]);
+            }
+        })
+    );
     return variants;
 }
 
@@ -494,18 +493,28 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // 第一步：按分辨率去重，每个高度只保留最高码率版本
-                const displayVariants = uniqueQualityVariants(baseVariants);
+                // 第一步：按分辨率去重，硬限制最多6个档位，避免极端场景探测过多
+                const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
                 console.log(`[list_q] 推文${tweetId} 原始画质${baseVariants.length}个，去重后待检测${displayVariants.length}个`);
 
-                // 第二步：同步探测所有展示档位的体积
-                console.log(`[list_q] 开始检测文件大小...`);
-                await fillVariantsSize(displayVariants);
-                console.log(`[list_q] 大小检测完成`);
+                // 第二步：从高到低逐级探测，找到第一个≤50MB立即停止，后续档位不探测
+                console.log(`[list_q] 开始逐级检测文件大小...`);
+                let foundUnderLimit = false;
+                for (const v of displayVariants) {
+                    if (foundUnderLimit) {
+                        v.size = -1; // 标记为无需展示
+                        continue;
+                    }
+                    v.size = await getFileSize(v.url);
+                    if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
+                        foundUnderLimit = true;
+                    }
+                }
+                console.log(`[list_q] 大小检测完成，是否找到可发送档位: ${foundUnderLimit}`);
                 cacheData.time = Date.now();
 
-                // 第三步：过滤展示，≤50MB仅保留最高清一个
-                const finalVariants = prepareDisplayVariants(displayVariants);
+                // 第三步：过滤掉标记为无需展示的低清档位
+                const finalVariants = displayVariants.filter(v => v.size !== -1);
 
                 const keyboard = finalVariants.map((v) => {
                     const sizeText = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
