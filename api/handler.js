@@ -9,7 +9,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const CONFIG = {
     BOT_UPLOAD_LIMIT: 50 * 1024 * 1024,   // Telegram 单文件上传上限 50MB
     MIN_DISPLAY_HEIGHT: 480,              // 最低有效画质高度（过滤极低画质）
-    HEAD_TIMEOUT: 3000,                   // HEAD 请求超时（ms），适配X平台CDN波动
+    HEAD_TIMEOUT: 3000,                   // 文件大小探测超时（ms），适配X平台CDN波动
     DOWNLOAD_TIMEOUT: 20000,               // 视频下载超时（ms）
     TWEET_CACHE_MS: 5 * 60 * 1000,        // 推文数据缓存时长 5分钟
     SIZE_CACHE_MS: 10 * 60 * 1000,        // 文件大小缓存时长 10分钟
@@ -41,6 +41,7 @@ async function quickFetch(url, options = {}, timeoutMs = 3500) {
     }
 }
 
+// === 修复3: 并发控制器增加异常兜底，单个任务失败不阻塞整体 ===
 /** 并发任务控制器，限制同时执行的任务数量 */
 async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     const results = [];
@@ -48,7 +49,11 @@ async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
     async function worker() {
         while (index < tasks.length) {
             const i = index++;
-            results[i] = await tasks[i]();
+            try {
+                results[i] = await tasks[i]();
+            } catch {
+                results[i] = 0;
+            }
         }
     }
     const workers = Array(Math.min(limit, tasks.length)).fill().map(worker);
@@ -148,12 +153,13 @@ async function getTweet(tweetId) {
 }
 
 // ======================
-// 文件大小缓存（含 Promise 去重 + Range 兜底）
+// 文件大小缓存（含 Promise 去重 + Range 直连）
 // ======================
 const sizeCache = new Map();
 const sizePending = new Map();
 
-/** 内部实现：探测单个文件大小，HEAD 优先，Range 兜底 */
+// === 修复2: 弃用HEAD请求，直接使用Range请求探测文件大小，适配X CDN ===
+/** 内部实现：探测单个文件大小，直接 Range 请求 */
 async function getFileSizeInternal(url) {
     const cached = sizeCache.get(url);
     if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
@@ -166,35 +172,23 @@ async function getFileSizeInternal(url) {
 
     const requestPromise = (async () => {
         try {
-            // 方案1：HEAD 请求读取 Content-Length
-            const hRes = await quickFetch(url, { method: "HEAD" }, CONFIG.HEAD_TIMEOUT);
-            const contentLength = hRes.headers.get("content-length");
-            if (contentLength) {
-                const size = parseInt(contentLength, 10);
-                cacheSet(sizeCache, url, { time: Date.now(), size });
-                return size;
-            }
-            throw new Error("No Content-Length");
-        } catch {
-            // 方案2：GET + Range 请求读取 Content-Range
-            try {
-                const rRes = await quickFetch(url, {
-                    method: "GET",
-                    headers: { "Range": "bytes=0-0" }
-                }, CONFIG.HEAD_TIMEOUT);
-                const contentRange = rRes.headers.get("content-range");
-                if (contentRange) {
-                    const match = contentRange.match(/\/(\d+)$/);
-                    if (match) {
-                        const size = parseInt(match[1], 10);
-                        cacheSet(sizeCache, url, { time: Date.now(), size });
-                        return size;
-                    }
+            const rRes = await quickFetch(url, {
+                method: "GET",
+                headers: { "Range": "bytes=0-0" }
+            }, CONFIG.HEAD_TIMEOUT);
+            
+            const contentRange = rRes.headers.get("content-range");
+            if (contentRange) {
+                const match = contentRange.match(/\/(\d+)$/);
+                if (match) {
+                    const size = parseInt(match[1], 10);
+                    cacheSet(sizeCache, url, { time: Date.now(), size });
+                    return size;
                 }
-                return 0;
-            } catch {
-                return 0;
             }
+            return 0;
+        } catch {
+            return 0;
         } finally {
             sizePending.delete(url);
         }
@@ -241,7 +235,7 @@ function dedupeVariants(list) {
     return [...map.values()];
 }
 
-/** 【修正】画质排序规则：分辨率高度降序 → 码率降序，保证最高画质在前 */
+/** 画质排序规则：分辨率高度降序 → 码率降序，保证最高画质在前 */
 function compareVariant(a, b) {
     if (a.height !== b.height) return b.height - a.height;
     if (a.bitrate !== b.bitrate) return b.bitrate - a.bitrate;
@@ -333,7 +327,7 @@ function collectVideoVariants(media = {}) {
     });
 }
 
-/** 【修改】完整展示所有画质档位，不再裁剪 */
+/** 完整展示所有画质档位，不再裁剪 */
 function trimVariantsForButton(list) {
     return list;
 }
@@ -483,16 +477,13 @@ export default async function handler(req, res) {
                     return res.status(200).send('OK');
                 }
 
-                // ========== 核心修复：异步探测，不阻塞响应 ==========
-                // 后台静默填充所有画质体积，完成后自动写入缓存
-                fillVariantsSize(baseVariants)
-                    .then(() => { cacheData.time = Date.now(); })
-                    .catch(() => {});
+                // === 修复1: 同步等待体积探测完成，再渲染列表，彻底解决Vercel冻结问题 ===
+                await fillVariantsSize(baseVariants);
+                cacheData.time = Date.now(); // 刷新缓存时间
 
-                // 立即渲染画质列表，未探测的大小显示「检测中」
                 const buttonVariants = trimVariantsForButton(baseVariants);
                 const keyboard = buttonVariants.map((v) => {
-                    const sizeText = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '检测中...';
+                    const sizeText = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
                     const encodedUrl = encodeURIComponent(v.url);
                     return [{
                         text: `${v.label} · ${sizeText}`,
@@ -506,7 +497,7 @@ export default async function handler(req, res) {
                     body: JSON.stringify({
                         chat_id: chatId,
                         message_id: progressMsgId,
-                        text: `📊 <b>推文 [${tweetId}] 画质清单</b>\n<i>大小后台自动更新，稍后查看即可刷新</i>`,
+                        text: `📊 <b>推文 [${tweetId}] 画质清单</b>`,
                         parse_mode: 'HTML',
                         reply_markup: { inline_keyboard: keyboard }
                     })
@@ -610,7 +601,7 @@ export default async function handler(req, res) {
             // 从高到低逐个探测，找到第一个≤50MB的画质
             const best = await findBestUnderLimit(baseVariants);
 
-            // 后台异步预探测剩余所有档位体积，不阻塞发送
+            // 后台异步预探测剩余所有档位体积（仅缓存优化，失败不影响主流程）
             (async () => {
                 try {
                     for (const v of baseVariants) {
