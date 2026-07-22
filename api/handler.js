@@ -1,5 +1,5 @@
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHANNEL_ID_ENV = process.env.CHANNEL_ID;
+const BOT_TOKEN = process.env.BOT_TOKEN; 
+const CHANNEL_ID_ENV = process.env.CHANNEL_ID; 
 const ALLOWED_CHANNELS = CHANNEL_ID_ENV ? CHANNEL_ID_ENV.split(',').map(id => id.trim()).filter(Boolean) : [];
 const ADMIN_USER_ID = process.env.ALLOWED_USER_ID || process.env.ADMIN_USER_ID;
 const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -25,7 +25,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // ---------------------------------------------------------
 // Telegram API 请求封装
 // ---------------------------------------------------------
-async function telegramFetch(url, options, timeoutMs = 5000) {
+async function telegramFetch(url, options, timeoutMs = 7000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   const apiMethod = url.split('/').pop();
@@ -55,7 +55,7 @@ async function telegramFetch(url, options, timeoutMs = 5000) {
 }
 
 // ---------------------------------------------------------
-// Redis 封装与 60s 长效配置缓存
+// Redis 封装与 60s 配置缓存
 // ---------------------------------------------------------
 async function redisCmd(command, ...args) {
   if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
@@ -77,12 +77,13 @@ let cachedSettingsTime = 0;
 async function getBotSettingsCached() {
   const now = Date.now();
   if (cachedSettings && (now - cachedSettingsTime < 60000)) return cachedSettings;
-
+  
   const dedupRes = await redisCmd('get', 'config:dedup_enabled');
   const backupRes = await redisCmd('get', 'config:backup_enabled');
+  
   cachedSettings = {
-    dedupEnabled: dedupRes.result !== '0',
-    backupEnabled: backupRes.result !== '0'
+    dedupEnabled: dedupRes.ok ? dedupRes.result !== '0' : false,
+    backupEnabled: backupRes.ok ? backupRes.result !== '0' : false
   };
   cachedSettingsTime = now;
   return cachedSettings;
@@ -100,87 +101,57 @@ function getMessageLink(chatId, messageId) {
 }
 
 // ---------------------------------------------------------
-// Redis 去重记录：兼容旧值 "1"，新值存最早消息位置
+// 异步备份任务 (留底记录)
 // ---------------------------------------------------------
-export function buildDedupRecord(chatId, messageId, now = 0) {
-  return JSON.stringify({
-    chatId: String(chatId),
-    messageId,
-    createdAt: now
+async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
+  if (!ADMIN_USER_ID) return null;
+
+  const msgLink = getMessageLink(fromChatId, messageId);
+  let adminMsgId = null;
+  let backupSuccess = false;
+
+  const fwdRes = await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
   });
-}
 
-export function parseDedupRecord(value) {
-  if (!value) {
-    return { exists: false, hasSourceMessage: false, chatId: null, messageId: null };
-  }
-
-  if (value === '1') {
-    return { exists: true, hasSourceMessage: false, chatId: null, messageId: null };
-  }
-
-  try {
-    const data = JSON.parse(value);
-    if (data?.chatId && Number.isInteger(data?.messageId)) {
-      return {
-        exists: true,
-        hasSourceMessage: true,
-        chatId: String(data.chatId),
-        messageId: data.messageId
-      };
+  if (fwdRes.ok && fwdRes.data?.ok) {
+    backupSuccess = true;
+    adminMsgId = fwdRes.data.result.message_id;
+  } else {
+    const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
+    });
+    if (copyRes.ok && copyRes.data?.ok) {
+      backupSuccess = true;
+      adminMsgId = copyRes.data.result.message_id;
     }
-  } catch {
-    // 非 JSON 的老数据也按已去重处理，避免误删历史记录。
   }
 
-  return { exists: true, hasSourceMessage: false, chatId: null, messageId: null };
-}
+  const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
+  const statusNotice = !backupSuccess ? '\n⚠️ *(备份失败：源消息权限受限)*' : '';
 
-export function shouldResetStaleDedupRecord(copyResult) {
-  if (copyResult?.isRateLimit || copyResult?.isTimeout) return false;
-  return copyResult?.httpStatus === 400 || copyResult?.httpStatus === 403;
-}
-
-// ---------------------------------------------------------
-// 重复文件备份：发文本链接 + copy 当前重复文件备份
-// ---------------------------------------------------------
-async function sendDuplicateNotice(chatTitle, currentMessageId, meta, sourceRecord) {
-  if (!ADMIN_USER_ID) return { noticeSent: false };
-
-  const sourceLink = sourceRecord.hasSourceMessage
-    ? getMessageLink(sourceRecord.chatId, sourceRecord.messageId)
-    : null;
-  const fileNameText = meta.fileName ? `\n文件：${meta.fileName}` : '';
-  const sourceText = sourceLink
-    ? `\n最早消息：${sourceLink}`
-    : '\n最早消息：旧版记录未保存消息位置';
-
-  return telegramFetch(`${TELEGRAM_API}/sendMessage`, {
+  await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({
       chat_id: ADMIN_USER_ID,
-      text: `检测到重复文件\n频道：${chatTitle}\n类型：${meta.mediaType}${fileNameText}\n大小：${meta.fileSizeFormatted}\n当前消息ID：${currentMessageId}${sourceText}`,
-      disable_web_page_preview: true
+      text: `⚠️ **检测到重复文件**\n\n📢 **频道：** ${chatTitle}\n📦 **类型：** ${meta.mediaType}${fileNameText}\n📊 **大小：** ${meta.fileSizeFormatted}\n🆔 **消息ID：** \`${messageId}\`${statusNotice}`,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[{ text: `🔗 原消息 (#${messageId})`, url: msgLink }]]
+      }
     })
   });
-}
 
-async function copyMessageToAdmin(fromChatId, messageId) {
-  if (!ADMIN_USER_ID) return { ok: false, error: '未配置管理员' };
-  return telegramFetch(`${TELEGRAM_API}/copyMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({
-      chat_id: ADMIN_USER_ID,
-      from_chat_id: fromChatId,
-      message_id: messageId
-    })
-  });
+  return adminMsgId;
 }
 
 // ---------------------------------------------------------
-// 队列驱动 + 熔断 + maxRetries=2 次重试 (针对正常非重复消息)
+// 核心复制队列
 // ---------------------------------------------------------
 async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetries = 2) {
   return enqueueTask(async () => {
@@ -198,7 +169,9 @@ async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetrie
         body: JSON.stringify({ chat_id: chatId, from_chat_id: fromChatId, message_id: messageId })
       });
 
-      if (res.ok && res.data?.ok) return { success: true };
+      if (res.ok && res.data?.ok) {
+        return { success: true, messageId: res.data.result.message_id };
+      }
 
       if (res.isRateLimit) {
         nextAllowedCopyTime = Date.now() + (res.retryAfter * 1000) + 350;
@@ -213,7 +186,7 @@ async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetrie
 }
 
 // ---------------------------------------------------------
-// 删除消息与失败异常监控
+// 静默删除
 // ---------------------------------------------------------
 async function safeDeleteMessage(chatId, messageId) {
   const delRes = await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
@@ -223,8 +196,25 @@ async function safeDeleteMessage(chatId, messageId) {
   });
 
   if (!delRes.ok) {
-    console.error(`❌ [Delete Failed] chat_id: ${chatId} | message_id: ${messageId} | Status: ${delRes.httpStatus || 'Network Error'}`);
+    console.warn(`⚠️ [Delete Failed] chat_id: ${chatId} | message_id: ${messageId}`);
   }
+}
+
+// ---------------------------------------------------------
+// 辅助工具：下发跳转提醒卡片
+// ---------------------------------------------------------
+async function sendDuplicateNotice(chatId, targetChatId, originMsgId) {
+  const originLink = getMessageLink(targetChatId, originMsgId);
+  await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ 
+      chat_id: chatId, 
+      text: `🔗 **发现重复文件**\n[点击跳转查看原消息](${originLink})`, 
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true
+    })
+  });
 }
 
 // ---------------------------------------------------------
@@ -252,7 +242,7 @@ export default async function handler(req, res) {
 
     const messageId = message.message_id;
     const chatTitle = message.chat.title || currentChatId;
-
+    
     let uniqueId = null;
     let rawSizeBytes = 0;
     let fileName = null;
@@ -279,58 +269,47 @@ export default async function handler(req, res) {
       mediaType = 'Document';
     }
 
-    const fileSizeFormatted = rawSizeBytes > 0
+    const fileSizeFormatted = rawSizeBytes > 0 
       ? (rawSizeBytes > 1048576 ? `${(rawSizeBytes / 1048576).toFixed(2)} MB` : `${(rawSizeBytes / 1024).toFixed(1)} KB`)
       : 'Unknown';
 
     const settings = await getBotSettingsCached();
 
     // ---------------------------------------------------------
-    // 分支 1: Redis 去重拦截
+    // 分支 1: Redis 查重拦截 (直接拦截 + 老数据兼容)
     // ---------------------------------------------------------
     if (uniqueId && settings.dedupEnabled) {
       const redisKey = `file:${currentChatId}:${uniqueId}`;
-      const setRes = await redisCmd('set', redisKey, buildDedupRecord(currentChatId, messageId, Date.now()), 'NX');
+      const recordRes = await redisCmd('get', redisKey);
 
-      if (setRes.ok && setRes.result !== 'OK') {
-        const existingRes = await redisCmd('get', redisKey);
-        const sourceRecord = parseDedupRecord(existingRes.ok ? existingRes.result : null);
+      if (!recordRes.ok) {
+        console.error('❌ Redis 连接异常，终止处理以保护数据');
+        return res.status(200).send('OK');
+      }
 
-        if (sourceRecord.hasSourceMessage) {
-          if (!settings.backupEnabled || !ADMIN_USER_ID) {
-            await safeDeleteMessage(currentChatId, messageId);
-            return res.status(200).send('OK');
-          }
+      if (recordRes.result !== null) {
+        const valStr = String(recordRes.result);
 
-          const sourceCopyRes = await copyMessageToAdmin(sourceRecord.chatId, sourceRecord.messageId);
+        // 1.1 处理新 JSON 数据格式
+        let originData = null;
+        try { originData = JSON.parse(valStr); } catch (e) { originData = null; }
 
-          if (sourceCopyRes.ok && sourceCopyRes.data?.ok) {
-            await sendDuplicateNotice(chatTitle, messageId, {
-              mediaType, fileName, fileSizeFormatted
-            }, sourceRecord);
-            await safeDeleteMessage(currentChatId, messageId);
-            return res.status(200).send('OK');
-          }
+        if (originData && originData.origin_message_id) {
+          const targetChatId = originData.origin_chat_id || currentChatId;
+          const originMsgId = originData.origin_message_id;
+          
+          await safeDeleteMessage(currentChatId, messageId);
+          await sendDuplicateNotice(currentChatId, targetChatId, originMsgId);
+          return res.status(200).send('OK');
+        }
 
-          if (shouldResetStaleDedupRecord(sourceCopyRes)) {
-            await redisCmd('del', redisKey);
-            const resetRes = await redisCmd('set', redisKey, buildDedupRecord(currentChatId, messageId, Date.now()), 'NX');
-            if (!resetRes.ok || resetRes.result !== 'OK') {
-              await safeDeleteMessage(currentChatId, messageId);
-              return res.status(200).send('OK');
-            }
-          } else {
-            await safeDeleteMessage(currentChatId, messageId);
-            return res.status(200).send('OK');
-          }
-        } else {
+        // 1.2 兼容老数据 "1"：备份后直接删掉
+        if (valStr === "1") {
           if (settings.backupEnabled && ADMIN_USER_ID) {
-            await sendDuplicateNotice(chatTitle, messageId, {
+            processDuplicateBackup(chatTitle, currentChatId, messageId, {
               mediaType, fileName, fileSizeFormatted
-            }, sourceRecord);
-            await copyMessageToAdmin(currentChatId, messageId);
+            }).catch(() => {});
           }
-
           await safeDeleteMessage(currentChatId, messageId);
           return res.status(200).send('OK');
         }
@@ -338,18 +317,73 @@ export default async function handler(req, res) {
     }
 
     // ---------------------------------------------------------
-    // 分支 2: 正常新消息（复制无头卡片并删除原消息）
+    // 分支 2: 正常新消息处理 (抢锁 SET NX -> 成功后备份 -> 删除原消息)
     // ---------------------------------------------------------
+    // 步骤 1: 复制为无头消息
     const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
 
     if (copyProcess.success) {
+      // 步骤 2: 尝试抢占写入 Redis
+      if (uniqueId && settings.dedupEnabled) {
+        const redisKey = `file:${currentChatId}:${uniqueId}`;
+        
+        // 极致轻量的数据结构
+        const originPayload = JSON.stringify({
+          origin_chat_id: currentChatId,
+          origin_message_id: copyProcess.messageId,
+          backup_message_id: null
+        });
+
+        // ⭐ SET ... NX: 防并发写入
+        const setRes = await redisCmd('set', redisKey, originPayload, 'NX');
+        
+        // 【抢锁失败降级】：并发下被别人抢先写入了
+        if (!setRes.ok || setRes.result !== "OK") {
+          console.warn(`⚡ [高并发抢锁] 抢锁失败，降级为去重流程`);
+          
+          // 清理掉多余无头件和原始消息
+          await safeDeleteMessage(currentChatId, copyProcess.messageId);
+          await safeDeleteMessage(currentChatId, messageId);
+
+          // 重新读取赢家记录，下发跳转
+          const winRecord = await redisCmd('get', redisKey);
+          if (winRecord.ok && winRecord.result) {
+            try {
+              const winData = JSON.parse(winRecord.result);
+              if (winData.origin_message_id) {
+                await sendDuplicateNotice(currentChatId, winData.origin_chat_id || currentChatId, winData.origin_message_id);
+              }
+            } catch (e) {}
+          }
+          return res.status(200).send('OK');
+        }
+
+        // 步骤 3: 只有抢锁成功（成为真正唯一赢家）后，才触发管理员备份！
+        if (settings.backupEnabled && ADMIN_USER_ID) {
+          const backupMsgId = await processDuplicateBackup(chatTitle, currentChatId, messageId, {
+            mediaType, fileName, fileSizeFormatted
+          }).catch(() => null);
+
+          // 备份成功后，补写一次 backup_message_id 留底
+          if (backupMsgId) {
+            const updatedPayload = JSON.stringify({
+              origin_chat_id: currentChatId,
+              origin_message_id: copyProcess.messageId,
+              backup_message_id: backupMsgId
+            });
+            await redisCmd('set', redisKey, updatedPayload);
+          }
+        }
+      }
+
+      // 步骤 4: 顺利删除带头的用户原始消息
       await safeDeleteMessage(currentChatId, messageId);
     }
 
     return res.status(200).send('OK');
 
   } catch (err) {
-    console.error('Webhook Error:', err);
+    console.error('Webhook Unhandled Error:', err);
     return res.status(200).send('OK');
   }
 }
