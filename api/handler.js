@@ -1,670 +1,721 @@
-const BOT_TOKEN = process.env.BOT_TOKEN; 
-const CHANNEL_ID_ENV = process.env.CHANNEL_ID; 
-const ALLOWED_CHANNELS = CHANNEL_ID_ENV ? CHANNEL_ID_ENV.split(',').map(id => id.trim()).filter(Boolean) : [];
-const ADMIN_USER_ID = process.env.ALLOWED_USER_ID || process.env.ADMIN_USER_ID;
-const UPSTASH_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-// ---------------------------------------------------------
-// 1. 单实例队列 & 全局 429 熔断冷却器
-// ---------------------------------------------------------
-let nextAllowedCopyTime = 0;
-let copyTaskQueue = Promise.resolve();
+const BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "identity"
+};
 
-function enqueueTask(taskFn) {
-  const result = copyTaskQueue.then(() => taskFn());
-  copyTaskQueue = result.catch(() => {});
-  return result;
+const CONFIG = {
+    BOT_UPLOAD_LIMIT: 44 * 1024 * 1024, // 收紧至 44MB，为 Multipart 协议头预留空间
+    MIN_DISPLAY_HEIGHT: 160,
+    HEAD_TIMEOUT: 2000,
+    DOWNLOAD_TIMEOUT: 35000,
+    TWEET_CACHE_MS: 10 * 60 * 1000,
+    SIZE_CACHE_MS: 30 * 60 * 1000,
+    MAX_CACHE: 500,
+    HEAD_CONCURRENCY: 4,
+    TG_API_TIMEOUT: 5000
+};
+
+// ======================
+// 性能监控与分析 (Profiler)
+// ======================
+function createTimer(label) {
+    const start = Date.now();
+    return {
+        end(extra = '') {
+            const cost = Date.now() - start;
+            const extraStr = extra ? ` | ${extra}` : '';
+            console.log(`⏱️ [PERF] ${label}: ${cost}ms${extraStr}`);
+            return cost;
+        }
+    };
 }
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// ---------------------------------------------------------
-// 2. Telegram API 请求封装
-// ---------------------------------------------------------
-async function telegramFetch(url, options, timeoutMs = 7000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  const apiMethod = url.split('/').pop();
-
-  try {
-    options.signal = controller.signal;
-    const response = await fetch(url, options);
-    clearTimeout(timeoutId);
-
-    const data = await response.json().catch(() => null);
-
-    if (response.status === 429) {
-      const retryAfter = data?.parameters?.retry_after || 5;
-      console.warn(`🚨 [429 限流] ${apiMethod} | retry_after: ${retryAfter}s`);
-      return { ok: false, isRateLimit: true, retryAfter, data };
+function getMemoryUsageMB() {
+    if (typeof process !== 'undefined' && process.memoryUsage) {
+        const mem = process.memoryUsage();
+        return `RSS: ${(mem.rss / 1024 / 1024).toFixed(1)}MB, Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`;
     }
+    return 'N/A';
+}
 
-    if (!response.ok) {
-      return { ok: false, httpStatus: response.status, data };
+// ======================
+// 基础工具函数
+// ======================
+function escapeHTML(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+async function quickFetch(url, options = {}, timeoutMs = CONFIG.TG_API_TIMEOUT) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return res;
+    } catch (e) {
+        clearTimeout(id);
+        throw e;
     }
-
-    return { ok: true, data };
-  } catch (err) {
-    clearTimeout(timeoutId);
-    return { ok: false, isTimeout: err.name === 'AbortError', error: err };
-  }
 }
 
-// ---------------------------------------------------------
-// 3. Redis 操作封装与配置缓存
-// ---------------------------------------------------------
-async function redisCmd(command, ...args) {
-  if (!UPSTASH_REST_URL || !UPSTASH_REST_TOKEN) return { ok: false, error: '未配置 Redis' };
-  try {
-    const endpoint = [command, ...args].map(a => encodeURIComponent(a)).join('/');
-    const res = await fetch(`${UPSTASH_REST_URL}/${endpoint}`, {
-      headers: { Authorization: `Bearer ${UPSTASH_REST_TOKEN}` }
-    });
-    const data = await res.json();
-    if (res.status !== 200 || data.error) return { ok: false, error: data.error || `HTTP ${res.status}` };
-    return { ok: true, result: data.result };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-}
-
-let cachedSettings = null;
-let cachedSettingsTime = 0;
-async function getBotSettingsCached() {
-  const now = Date.now();
-  if (cachedSettings && (now - cachedSettingsTime < 60000)) return cachedSettings;
-  
-  const dedupRes = await redisCmd('get', 'config:dedup_enabled');
-  const backupRes = await redisCmd('get', 'config:backup_enabled');
-  
-  cachedSettings = {
-    dedupEnabled: dedupRes.ok ? dedupRes.result !== '0' : true,
-    backupEnabled: backupRes.ok ? backupRes.result !== '0' : true
-  };
-  cachedSettingsTime = now;
-  return cachedSettings;
-}
-
-function clearSettingsCache() {
-  cachedSettings = null;
-}
-
-// ---------------------------------------------------------
-// 4. 管理后台辅助工具函数 (从最早版本移植)
-// ---------------------------------------------------------
-async function getChannelsInfo() {
-  const list = [];
-  for (const id of ALLOWED_CHANNELS) {
-    const res = await telegramFetch(`${TELEGRAM_API}/getChat`, {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ chat_id: id })
-    });
-    if (res.ok && res.data?.ok) {
-      list.push({ id, title: res.data.result.title || id });
-    } else {
-      list.push({ id, title: `未命名频道 (${id})` });
-    }
-  }
-  return list;
-}
-
-async function getChannelKeyCount(channelId) {
-  const pattern = channelId ? `file:${channelId}:*` : `file:*`;
-  const keysRes = await redisCmd('keys', pattern);
-  return keysRes.ok && Array.isArray(keysRes.result) ? keysRes.result.length : 0;
-}
-
-async function clearChannelKeys(channelId) {
-  const pattern = channelId ? `file:${channelId}:*` : `file:*`;
-  const keysRes = await redisCmd('keys', pattern);
-  if (!keysRes.ok || !Array.isArray(keysRes.result) || keysRes.result.length === 0) {
-    return { ok: true, count: 0 };
-  }
-
-  const keys = keysRes.result;
-  const pipelineBody = keys.map(k => ["DEL", k]);
-  
-  try {
-    await fetch(`${UPSTASH_REST_URL}/pipeline`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${UPSTASH_REST_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipelineBody)
-    });
-    return { ok: true, count: keys.length };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-}
-
-async function buildMainMenu() {
-  const settings = await getBotSettingsCached();
-  const text = `🤖 **控制面板**\n\n` +
-               `点击下方按钮即可进行管理操作：`;
-
-  const keyboard = {
-    inline_keyboard: [
-      [
-        { text: "📢 选择频道管理记忆", callback_data: "select_channel" }
-      ],
-      [
-        { text: `去重功能: ${settings.dedupEnabled ? '✅ 开启中' : '❌ 已暂停'}`, callback_data: "toggle_dedup" },
-        { text: `私发备份: ${settings.backupEnabled ? '✅ 开启中' : '❌ 已关闭'}`, callback_data: "toggle_backup" }
-      ],
-      [
-        { text: "🩺 一键系统自检", callback_data: "system_health" },
-        { text: "🗑️ 清空所有记录", callback_data: "confirm_clean_all" }
-      ]
-    ]
-  };
-
-  return { text, reply_markup: keyboard };
-}
-
-// ---------------------------------------------------------
-// 5. 频道处理专用工具函数
-// ---------------------------------------------------------
-function getMessageLink(chatId, messageId) {
-  const strId = String(chatId);
-  if (strId.startsWith('-100')) {
-    return `https://t.me/c/${strId.replace('-100', '')}/${messageId}`;
-  }
-  return `https://t.me/${strId.replace('@', '')}/${messageId}`;
-}
-
-async function processDuplicateBackup(chatTitle, fromChatId, messageId, meta) {
-  if (!ADMIN_USER_ID) return null;
-
-  const msgLink = getMessageLink(fromChatId, messageId);
-  let adminMsgId = null;
-  let backupSuccess = false;
-
-  const fwdRes = await telegramFetch(`${TELEGRAM_API}/forwardMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
-  });
-
-  if (fwdRes.ok && fwdRes.data?.ok) {
-    backupSuccess = true;
-    adminMsgId = fwdRes.data.result.message_id;
-  } else {
-    const copyRes = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ chat_id: ADMIN_USER_ID, from_chat_id: fromChatId, message_id: messageId })
-    });
-    if (copyRes.ok && copyRes.data?.ok) {
-      backupSuccess = true;
-      adminMsgId = copyRes.data.result.message_id;
-    }
-  }
-
-  const fileNameText = meta.fileName ? `\n📁 **文件：** \`${meta.fileName}\`` : '';
-  const statusNotice = !backupSuccess ? '\n⚠️ *(备份失败：源消息权限受限)*' : '';
-
-  await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({
-      chat_id: ADMIN_USER_ID,
-      text: `⚠️ **检测到重复文件**\n\n📢 **频道：** ${chatTitle}\n📦 **类型：** ${meta.mediaType}${fileNameText}\n📊 **大小：** ${meta.fileSizeFormatted}\n🆔 **消息ID：** \`${messageId}\`${statusNotice}`,
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [[{ text: `🔗 原消息 (#${messageId})`, url: msgLink }]]
-      }
-    })
-  });
-
-  return adminMsgId;
-}
-
-async function executeCopyTaskWithRetry(chatId, fromChatId, messageId, maxRetries = 2) {
-  return enqueueTask(async () => {
-    for (let i = 0; i < maxRetries; i++) {
-      const now = Date.now();
-      if (now < nextAllowedCopyTime) {
-        await sleep(nextAllowedCopyTime - now);
-      }
-
-      await sleep(350);
-
-      const res = await telegramFetch(`${TELEGRAM_API}/copyMessage`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: chatId, from_chat_id: fromChatId, message_id: messageId })
-      });
-
-      if (res.ok && res.data?.ok) {
-        return { success: true, messageId: res.data.result.message_id };
-      }
-
-      if (res.isRateLimit) {
-        nextAllowedCopyTime = Date.now() + (res.retryAfter * 1000) + 350;
-        await sleep((res.retryAfter * 1000) + 350);
-        continue;
-      }
-
-      await sleep(500 * Math.pow(2, i));
-    }
-    return { success: false };
-  });
-}
-
-async function safeDeleteMessage(chatId, messageId) {
-  await telegramFetch(`${TELEGRAM_API}/deleteMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ chat_id: chatId, message_id: messageId })
-  });
-}
-
-async function sendDuplicateNotice(chatId, targetChatId, originMsgId) {
-  const originLink = getMessageLink(targetChatId, originMsgId);
-  await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ 
-      chat_id: chatId, 
-      text: `🔗 **发现重复文件**\n[点击跳转查看原消息](${originLink})`, 
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true
-    })
-  });
-}
-
-// ---------------------------------------------------------
-// 6. Webhook 主入口 (完整三大路由分发)
-// ---------------------------------------------------------
-export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-  const body = req.body || {};
-
-  try {
-    // =========================================================
-    // 路由 1：处理管理员后台交互按钮 (Callback Query)
-    // =========================================================
-    if (body.callback_query) {
-      const cb = body.callback_query;
-      const userId = String(cb.from.id);
-      const cbId = cb.id;
-      const chatId = cb.message.chat.id;
-      const msgId = cb.message.message_id;
-
-      if (ADMIN_USER_ID && userId !== String(ADMIN_USER_ID)) {
-        await telegramFetch(`${TELEGRAM_API}/answerCallbackQuery`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ callback_query_id: cbId, text: '⛔ 仅管理员可操作！', show_alert: true })
-        });
-        return res.status(200).send('OK');
-      }
-
-      const action = cb.data;
-
-      if (action === 'menu_main') {
-        const menu = await buildMainMenu();
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
-        });
-      }
-      else if (action === 'select_channel') {
-        const channels = await getChannelsInfo();
-        const buttons = channels.map(c => ([
-          { text: `📢 ${c.title}`, callback_data: `view_chan_${c.id}` }
-        ]));
-        buttons.push([{ text: "⬅️ 返回主菜单", callback_data: "menu_main" }]);
-
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: msgId,
-            text: `📢 **请点击要管理的频道名字：**`,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: buttons }
-          })
-        });
-      }
-      else if (action.startsWith('view_chan_')) {
-        const chanId = action.replace('view_chan_', '');
-        const count = await getChannelKeyCount(chanId);
-        
-        const resChan = await telegramFetch(`${TELEGRAM_API}/getChat`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chanId })
-        });
-        const title = resChan.ok ? resChan.data.result.title : chanId;
-
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: msgId,
-            text: `📌 **频道名称：** \`${title}\`\n` +
-                  `🆔 **频道 ID：** \`${chanId}\`\n` +
-                  `💾 **已记录去重文件数：** \`${count}\` 个\n\n` +
-                  `你可以点击下方按钮清空该频道的记忆，以便重新发送过往文件：`,
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: `🗑️ 清空「${title}」的去重记忆`, callback_data: `clean_chan_${chanId}` }],
-                [{ text: "⬅️ 返回频道列表", callback_data: "select_channel" }]
-              ]
-            }
-          })
-        });
-      }
-      else if (action.startsWith('clean_chan_')) {
-        const chanId = action.replace('clean_chan_', '');
-        const resClean = await clearChannelKeys(chanId);
-        const msgText = resClean.ok 
-          ? `✅ **清理完成！**\n已清空该频道 \`${resClean.count}\` 条文件记忆。`
-          : `❌ 清理失败：${resClean.error}`;
-
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: msgId,
-            text: msgText,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: "⬅️ 返回频道列表", callback_data: "select_channel" }]] }
-          })
-        });
-      }
-      else if (action === 'toggle_dedup') {
-        const settings = await getBotSettingsCached();
-        await redisCmd('set', 'config:dedup_enabled', settings.dedupEnabled ? '0' : '1');
-        clearSettingsCache();
-        const menu = await buildMainMenu();
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
-        });
-      }
-      else if (action === 'toggle_backup') {
-        const settings = await getBotSettingsCached();
-        await redisCmd('set', 'config:backup_enabled', settings.backupEnabled ? '0' : '1');
-        clearSettingsCache();
-        const menu = await buildMainMenu();
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({ chat_id: chatId, message_id: msgId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
-        });
-      }
-      else if (action === 'confirm_clean_all') {
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: msgId,
-            text: `⚠️ **高危操作确认**\n\n确定要清空**所有频道**的去重记忆吗？`,
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: "🔥 确认彻底清空", callback_data: "do_clean_all" },
-                  { text: "❌ 取消", callback_data: "menu_main" }
-                ]
-              ]
-            }
-          })
-        });
-      }
-      else if (action === 'do_clean_all') {
-        const resClean = await clearChannelKeys(null);
-        const msgText = resClean.ok ? `✅ **全局清理成功！** 共清除 \`${resClean.count}\` 条数据库记录。` : `❌ 清理失败：${resClean.error}`;
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: msgId,
-            text: msgText,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: "⬅️ 返回主菜单", callback_data: "menu_main" }]] }
-          })
-        });
-      }
-      else if (action === 'system_health') {
-        let report = `🩺 **系统健康自检报告**\n\n`;
-
-        const startT = Date.now();
-        const pingRes = await redisCmd('ping');
-        const delay = Date.now() - startT;
-        report += `💾 **Redis 数据库：** ${pingRes.ok ? `✅ 正常 (${delay}ms)` : `❌ 异常 (${pingRes.error})`}\n\n`;
-
-        report += `📢 **频道管理员权限检测：**\n`;
-        const channels = await getChannelsInfo();
-        const botId = BOT_TOKEN ? BOT_TOKEN.split(':')[0] : '';
-        for (const c of channels) {
-          const memberRes = await telegramFetch(`${TELEGRAM_API}/getChatMember`, {
+async function tg(method, data, parse = true) {
+    const res = await quickFetch(
+        `${TELEGRAM_API}/${method}`,
+        {
             method: 'POST',
             headers: JSON_HEADERS,
-            body: JSON.stringify({ chat_id: c.id, user_id: botId })
-          });
+            body: JSON.stringify(data)
+        },
+        CONFIG.TG_API_TIMEOUT
+    );
+    if (!parse) return res.ok;
+    return await res.json();
+}
 
-          if (memberRes.ok && memberRes.data?.result?.status === 'administrator') {
-            const adm = memberRes.data.result;
-            const canDelete = adm.can_delete_messages ? '✅' : '❌无删除权限';
-            const canPost = adm.can_post_messages ? '✅' : '❌无发帖权限';
-            report += `• **${c.title}**\n  - 发帖: ${canPost} | 删帖: ${canDelete}\n`;
-          } else {
-            report += `• **${c.title}**\n  - ❌ 机器人未获取到管理员身份\n`;
-          }
+async function tgMultipart(method, fields, fileField, fileBlob, fileName = "video.mp4") {
+    const formData = new FormData();
+    for (const [k, v] of Object.entries(fields)) {
+        if (typeof v === 'object') {
+            formData.append(k, JSON.stringify(v));
+        } else if (v !== undefined && v !== null) {
+            formData.append(k, String(v));
         }
+    }
+    formData.append(fileField, fileBlob, fileName);
 
-        await telegramFetch(`${TELEGRAM_API}/editMessageText`, {
-          method: 'POST',
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: msgId,
-            text: report,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: "⬅️ 返回主菜单", callback_data: "menu_main" }]] }
-          })
-        });
-      }
-
-      await telegramFetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+    const res = await fetch(`${TELEGRAM_API}/${method}`, {
         method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ callback_query_id: cbId })
-      });
+        body: formData
+    });
+    return await res.json();
+}
 
-      return res.status(200).send('OK');
-    }
-
-    // =========================================================
-    // 路由 2：处理私聊消息（管理员弹出主控制面板）
-    // =========================================================
-    const message = body.channel_post || body.message;
-    if (!message) return res.status(200).send('OK');
-    if (!BOT_TOKEN || ALLOWED_CHANNELS.length === 0) return res.status(200).send('OK');
-
-    const currentChatId = String(message.chat.id);
-    const isPrivate = message.chat.type === 'private';
-    const userId = String(message.from?.id || '');
-
-    if (isPrivate) {
-      if (ADMIN_USER_ID && userId !== String(ADMIN_USER_ID)) {
-        return res.status(200).send('OK - Unauthorized');
-      }
-      const menu = await buildMainMenu();
-      await telegramFetch(`${TELEGRAM_API}/sendMessage`, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ chat_id: currentChatId, text: menu.text, parse_mode: 'Markdown', reply_markup: menu.reply_markup })
-      });
-      return res.status(200).send('OK');
-    }
-
-    // =========================================================
-    // 路由 3：核心频道转发去重逻辑 (原汁原味的优化版)
-    // =========================================================
-    if (!ALLOWED_CHANNELS.includes(currentChatId)) return res.status(200).send('OK');
-    if (message.author_signature === 'Bot' || message.from?.is_bot) return res.status(200).send('OK');
-
-    const video = message.video;
-    const photo = message.photo;
-    const animation = message.animation;
-    const document = message.document;
-
-    if (!video && !photo && !animation && !document) return res.status(200).send('OK');
-
-    const messageId = message.message_id;
-    const chatTitle = message.chat.title || currentChatId;
-    
-    let uniqueId = null;
-    let rawSizeBytes = 0;
-    let fileName = null;
-    let mediaType = 'Unknown';
-
-    if (video) {
-      uniqueId = video.file_unique_id;
-      rawSizeBytes = video.file_size || 0;
-      fileName = video.file_name || null;
-      mediaType = 'Video';
-    } else if (photo) {
-      uniqueId = photo[photo.length - 1].file_unique_id;
-      rawSizeBytes = photo[photo.length - 1].file_size || 0;
-      mediaType = 'Photo';
-    } else if (animation) {
-      uniqueId = animation.file_unique_id;
-      rawSizeBytes = animation.file_size || 0;
-      fileName = animation.file_name || null;
-      mediaType = 'Animation';
-    } else if (document) {
-      uniqueId = document.file_unique_id;
-      rawSizeBytes = document.file_size || 0;
-      fileName = document.file_name || null;
-      mediaType = 'Document';
-    }
-
-    const fileSizeFormatted = rawSizeBytes > 0 
-      ? (rawSizeBytes > 1048576 ? `${(rawSizeBytes / 1048576).toFixed(2)} MB` : `${(rawSizeBytes / 1024).toFixed(1)} KB`)
-      : 'Unknown';
-
-    const settings = await getBotSettingsCached();
-
-    // ---------------------------------------------------------
-    // 分支 3.1: Redis 查重拦截 (拦截 + 老数据兼容)
-    // ---------------------------------------------------------
-    if (uniqueId && settings.dedupEnabled) {
-      const redisKey = `file:${currentChatId}:${uniqueId}`;
-      const recordRes = await redisCmd('get', redisKey);
-
-      if (!recordRes.ok) {
-        console.error('❌ Redis 连接异常，终止处理以保护数据');
-        return res.status(200).send('OK');
-      }
-
-      if (recordRes.result !== null) {
-        const valStr = String(recordRes.result);
-
-        // 新 JSON 格式处理
-        let originData = null;
-        try { originData = JSON.parse(valStr); } catch (e) { originData = null; }
-
-        if (originData && originData.origin_message_id) {
-          const targetChatId = originData.origin_chat_id || currentChatId;
-          const originMsgId = originData.origin_message_id;
-          
-          await safeDeleteMessage(currentChatId, messageId);
-          await sendDuplicateNotice(currentChatId, targetChatId, originMsgId);
-          return res.status(200).send('OK');
-        }
-
-        // 老数据 "1" 兼容处理
-        if (valStr === "1") {
-          if (settings.backupEnabled && ADMIN_USER_ID) {
-            processDuplicateBackup(chatTitle, currentChatId, messageId, {
-              mediaType, fileName, fileSizeFormatted
-            }).catch(() => {});
-          }
-          await safeDeleteMessage(currentChatId, messageId);
-          return res.status(200).send('OK');
-        }
-      }
-    }
-
-    // ---------------------------------------------------------
-    // 分支 3.2: 正常新文件 (复制无头件 -> SET NX 抢锁 -> 备份 -> 删原件)
-    // ---------------------------------------------------------
-    const copyProcess = await executeCopyTaskWithRetry(currentChatId, currentChatId, messageId);
-
-    if (copyProcess.success) {
-      if (uniqueId && settings.dedupEnabled) {
-        const redisKey = `file:${currentChatId}:${uniqueId}`;
-        
-        const originPayload = JSON.stringify({
-          origin_chat_id: currentChatId,
-          origin_message_id: copyProcess.messageId,
-          backup_message_id: null
-        });
-
-        // SET NX 防并发
-        const setRes = await redisCmd('set', redisKey, originPayload, 'NX');
-        
-        // 抢锁失败降级处理
-        if (!setRes.ok || setRes.result !== "OK") {
-          console.warn(`⚡ [高并发抢锁] 抢锁失败，降级为去重流程`);
-          
-          await safeDeleteMessage(currentChatId, copyProcess.messageId);
-          await safeDeleteMessage(currentChatId, messageId);
-
-          const winRecord = await redisCmd('get', redisKey);
-          if (winRecord.ok && winRecord.result) {
+async function limitConcurrency(tasks, limit = CONFIG.HEAD_CONCURRENCY) {
+    const results = [];
+    let index = 0;
+    async function worker() {
+        while (index < tasks.length) {
+            const i = index++;
             try {
-              const winData = JSON.parse(winRecord.result);
-              if (winData.origin_message_id) {
-                await sendDuplicateNotice(currentChatId, winData.origin_chat_id || currentChatId, winData.origin_message_id);
-              }
-            } catch (e) {}
-          }
-          return res.status(200).send('OK');
+                results[i] = await tasks[i]();
+            } catch {
+                results[i] = 0;
+            }
         }
+    }
+    const workers = Array(Math.min(limit, tasks.length)).fill().map(worker);
+    await Promise.all(workers);
+    return results;
+}
 
-        // 抢锁成功者（唯一赢家）触发备份
-        if (settings.backupEnabled && ADMIN_USER_ID) {
-          const backupMsgId = await processDuplicateBackup(chatTitle, currentChatId, messageId, {
-            mediaType, fileName, fileSizeFormatted
-          }).catch(() => null);
-
-          if (backupMsgId) {
-            const updatedPayload = JSON.stringify({
-              origin_chat_id: currentChatId,
-              origin_message_id: copyProcess.messageId,
-              backup_message_id: backupMsgId
-            });
-            await redisCmd('set', redisKey, updatedPayload);
-          }
+// ======================
+// 画质去重与展示
+// ======================
+function dedupeVariants(list) {
+    const map = new Map();
+    for (const v of list) {
+        const key = `${v.width}x${v.height}`;
+        const existing = map.get(key);
+        if (!existing || v.bitrate > existing.bitrate) {
+            map.set(key, v);
         }
-      }
+    }
+    return [...map.values()];
+}
 
-      // 删除用户带头的原始消息
-      await safeDeleteMessage(currentChatId, messageId);
+function uniqueQualityVariants(list) {
+    return dedupeVariants(list).sort(compareVariant);
+}
+
+function prepareDisplayVariants(variants) {
+    let bestUnderLimitFound = false;
+    return variants.filter(v => {
+        if (v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) {
+            if (bestUnderLimitFound) return false;
+            bestUnderLimitFound = true;
+            return true;
+        }
+        return true;
+    });
+}
+
+// ======================
+// 消息文案生成（直接根据 variant.size 实时判定，拒绝外部参数污染）
+// ======================
+function buildCaption(tweet, options = {}) {
+    const { variant = null, isManual = false, autoSelected = false } = options;
+    const authorLink = `https://x.com/${tweet.author.screen_name}`;
+    const originalTweetLink = `https://x.com/i/status/${tweet.id}`;
+    const lines = [];
+
+    // 单一事实源：实时计算是否超限
+    const isOverSize = variant ? (variant.size > CONFIG.BOT_UPLOAD_LIMIT) : false;
+
+    if (variant) {
+        const sizeMB = variant.size > 0 ? `${(variant.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
+        lines.push(`🎞 ${variant.label} · ${sizeMB}`);
     }
 
-    return res.status(200).send('OK');
+    lines.push(`👤 <a href="${authorLink}">${escapeHTML(tweet.author.name)}</a> (@${tweet.author.screen_name})`);
+    lines.push(`🔗 <a href="${originalTweetLink}">查看原推文</a>`);
 
-  } catch (err) {
-    console.error('Webhook Unhandled Error:', err);
+    if (isOverSize && variant) {
+        const sizeMB = variant.size > 0 ? `${(variant.size / (1024 * 1024)).toFixed(1)} MB` : '未知';
+        if (variant.url.length > 300) {
+            lines.push(`⚠️ 该画质过大 (${sizeMB}) 无法直接发送\n🚀 高清原片链接过长，请通过画质按钮选择下载`);
+        } else {
+            lines.push(`⚠️ 该画质过大 (${sizeMB}) 无法直接发送\n🚀 <a href="${variant.url}">点此下载高清原片</a>`);
+        }
+    }
+
+    lines.push('──────────');
+    lines.push(escapeHTML(tweet.text));
+
+    if (variant) {
+        if (isManual) lines.push(`\n⚙️ <i>手动指定投递画质: ${variant.label}</i>`);
+        else if (autoSelected) lines.push(`\n💡 <i>画质已智能适配调整至: ${variant.label}</i>`);
+    }
+
+    return lines.join('\n');
+}
+
+// ======================
+// LRU 缓存机制
+// ======================
+function cacheSet(cache, key, value) {
+    if (cache.size >= CONFIG.MAX_CACHE) {
+        const first = cache.keys().next().value;
+        cache.delete(first);
+    }
+    cache.set(key, value);
+}
+
+// ======================
+// 推文数据获取与缓存
+// ======================
+const tweetCache = new Map();
+const tweetPending = new Map();
+
+async function getTweet(tweetId) {
+    const timer = createTimer(`getTweet [${tweetId}]`);
+
+    const cached = tweetCache.get(tweetId);
+    if (cached && Date.now() - cached.time < CONFIG.TWEET_CACHE_MS) {
+        timer.end('命中本地 LRU 缓存');
+        return cached;
+    }
+
+    if (tweetPending.has(tweetId)) {
+        const res = await tweetPending.get(tweetId);
+        timer.end('合并并发请求等待');
+        return res;
+    }
+
+    const requestPromise = (async () => {
+        try {
+            const fxRes = await quickFetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {}, CONFIG.TG_API_TIMEOUT);
+            if (!fxRes.ok) throw new Error("FxTwitter 请求失败");
+
+            const json = await fxRes.json();
+            const rawVariants = collectVideoVariants(json.tweet.media);
+            const baseVariants = dedupeVariants(rawVariants);
+            baseVariants.sort(compareVariant);
+
+            const cacheData = {
+                time: Date.now(),
+                tweet: json.tweet,
+                baseVariants
+            };
+            cacheSet(tweetCache, tweetId, cacheData);
+            return cacheData;
+        } finally {
+            tweetPending.delete(tweetId);
+        }
+    })();
+
+    tweetPending.set(tweetId, requestPromise);
+    const result = await requestPromise;
+    timer.end(`解析完成, 找到 ${result.baseVariants.length} 个不重复分辨率视频流`);
+    return result;
+}
+
+// ======================
+// 文件大小探测 (Range: bytes=0-1)
+// ======================
+const sizeCache = new Map();
+const sizePending = new Map();
+
+async function getFileSizeInternal(url) {
+    const cached = sizeCache.get(url);
+    if (cached && Date.now() - cached.time < CONFIG.SIZE_CACHE_MS) {
+        return cached.size;
+    }
+
+    if (sizePending.has(url)) {
+        return sizePending.get(url);
+    }
+
+    const requestPromise = (async () => {
+        try {
+            const rRes = await quickFetch(url, {
+                method: "GET",
+                headers: {
+                    ...BROWSER_HEADERS,
+                    "Range": "bytes=0-1"
+                }
+            }, CONFIG.HEAD_TIMEOUT);
+
+            rRes.body?.cancel?.();
+
+            const contentRange = rRes.headers.get("content-range");
+            if (contentRange) {
+                const match = contentRange.match(/\/(\d+)$/);
+                if (match) {
+                    const size = parseInt(match[1], 10);
+                    cacheSet(sizeCache, url, { time: Date.now(), size });
+                    return size;
+                }
+            }
+
+            const contentLength = rRes.headers.get("content-length");
+            if (contentLength) {
+                const size = parseInt(contentLength, 10);
+                cacheSet(sizeCache, url, { time: Date.now(), size });
+                return size;
+            }
+
+            return 0;
+        } catch {
+            return 0;
+        } finally {
+            sizePending.delete(url);
+        }
+    })();
+
+    sizePending.set(url, requestPromise);
+    return requestPromise;
+}
+
+async function getFileSize(url) {
+    return await getFileSizeInternal(url);
+}
+
+async function fillVariantsSize(variants) {
+    const timer = createTimer(`fillVariantsSize [${variants.length}个画质探测]`);
+    const tasks = variants.map(v => () => getFileSize(v.url));
+    const sizes = await limitConcurrency(tasks, CONFIG.HEAD_CONCURRENCY);
+    variants.forEach((v, idx) => v.size = sizes[idx]);
+    timer.end(variants.map(v => `${v.label}: ${(v.size / 1024 / 1024).toFixed(1)}MB`).join(', '));
+    return variants;
+}
+
+// ======================
+// 视频画质处理工具
+// ======================
+function normalizeVideoUrl(url) {
+    return url.trim();
+}
+
+function compareVariant(a, b) {
+    if (a.height !== b.height) return b.height - a.height;
+    if (a.bitrate !== b.bitrate) return b.bitrate - a.bitrate;
+    return 0;
+}
+
+function parseVideoVariant(v, idx = 0) {
+    let width = 0;
+    let height = 0;
+
+    if (v.width && v.height) {
+        width = v.width;
+        height = v.height;
+    } else {
+        const match = v.url.match(/(\d+)x(\d+)/);
+        if (match) {
+            width = Number(match[1]);
+            height = Number(match[2]);
+        }
+    }
+
+    const label = width && height ? `${width}×${height}` : `未知画质 ${idx + 1}`;
+    const type = v.content_type || v.container || "video/mp4";
+    const isHLS = type.includes("mpegURL") || type.includes("m3u8");
+
+    return {
+        url: normalizeVideoUrl(v.url),
+        width,
+        height,
+        bitrate: v.bitrate || 0,
+        label,
+        size: 0,
+        isHLS,
+        source: isHLS ? "m3u8" : "mp4"
+    };
+}
+
+function walkMedia(obj, collector, visited) {
+    if (!obj) return;
+    if (typeof obj === 'object') {
+        if (visited.has(obj)) return;
+        visited.add(obj);
+    }
+    if (Array.isArray(obj)) {
+        obj.forEach(item => walkMedia(item, collector, visited));
+        return;
+    }
+    if (typeof obj !== "object") return;
+
+    if (Array.isArray(obj.variants)) collector.push(...obj.variants);
+    if (Array.isArray(obj.formats)) collector.push(...obj.formats);
+    if (Array.isArray(obj.videos)) collector.push(...obj.videos);
+    if (Array.isArray(obj.all_videos)) collector.push(...obj.all_videos);
+
+    for (const value of Object.values(obj)) {
+        walkMedia(value, collector, visited);
+    }
+}
+
+function collectVideoVariants(media = {}) {
+    const rawItems = [];
+    const visited = new WeakSet();
+    walkMedia(media, rawItems, visited);
+
+    const parsedList = [];
+    rawItems.forEach(item => {
+        if (!item || !item.url) return;
+        if (item.content_type && !item.content_type.includes("video") && !item.content_type.includes("mpegURL")) return;
+        if (item.container && item.container !== "mp4" && item.container !== "m3u8") return;
+
+        const parsed = parseVideoVariant(item);
+        parsed.bitrate = item.bitrate || parsed.bitrate || 0;
+        parsedList.push(parsed);
+    });
+
+    const deduped = dedupeVariants(parsedList);
+
+    return deduped.filter(v => {
+        if (v.isHLS) return false;
+        if (v.width <= 0 || v.height <= 0) return false;
+        if (v.width > 7680 || v.height > 7680) return false;
+        if (v.height < CONFIG.MIN_DISPLAY_HEIGHT) return false;
+        return true;
+    });
+}
+
+async function findBestUnderLimit(variants) {
+    await fillVariantsSize(variants);
+    return variants.find(v => v.size > 0 && v.size <= CONFIG.BOT_UPLOAD_LIMIT) || null;
+}
+
+// ======================
+// 核心发送逻辑 (增加 SIZE CHECK 诊断日志)
+// ======================
+async function sendSpecificVideo(chatId, tweet, variant, options = {}) {
+    const totalTimer = createTimer(`sendSpecificVideo [${variant.label}]`);
+    const { isManual = false, autoSelected = false } = options;
+    const tweetId = tweet.id;
+    const replyMarkup = {
+        inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]]
+    };
+
+    // 🔍 核心诊断日志：精准追踪 Byte 级别的判定过程
+    console.log(
+        `🔍 [SIZE CHECK] Label: ${variant.label} | SizeBytes: ${variant.size} | LimitBytes: ${CONFIG.BOT_UPLOAD_LIMIT} | ComputedMB: ${(variant.size / 1024 / 1024).toFixed(2)} MB | OverLimit: ${variant.size > CONFIG.BOT_UPLOAD_LIMIT}`
+    );
+
+    // 1. 超大视频退化
+    if (variant.size > CONFIG.BOT_UPLOAD_LIMIT) {
+        await tg('sendMessage', {
+            chat_id: chatId,
+            text: buildCaption(tweet, { variant, isManual, autoSelected }),
+            parse_mode: 'HTML',
+            reply_markup: replyMarkup
+        });
+        totalTimer.end(`视频超限(>${(CONFIG.BOT_UPLOAD_LIMIT / 1024 / 1024).toFixed(0)}MB)，退化发送文本链接`);
+        return;
+    }
+
+    const caption = buildCaption(tweet, { variant, isManual, autoSelected });
+
+    // 2. 尝试 TG URL 直传
+    const tgDirectTimer = createTimer(`TG URL Direct Upload [${variant.label}]`);
+    try {
+        const json = await tg('sendVideo', {
+            chat_id: chatId,
+            video: variant.url,
+            caption,
+            parse_mode: 'HTML',
+            show_caption_above_media: true,
+            reply_markup: replyMarkup,
+            supports_streaming: true,
+            width: variant.width,
+            height: variant.height,
+            disable_content_type_detection: true
+        });
+
+        if (json.ok) {
+            tgDirectTimer.end('直传成功 🎉');
+            totalTimer.end('总发送完成 (URL 直传通道)');
+            return;
+        }
+        tgDirectTimer.end(`直传被拒: ${json.description}`);
+    } catch (e) {
+        tgDirectTimer.end(`直传网络异常: ${e.message}`);
+    }
+
+    // 3. Worker 中转下载与 Multipart 上传
+    console.log(`⚠️ 进入降级中转模式... 当前内存: ${getMemoryUsageMB()}`);
+    
+    // 3.1 下载
+    const downloadTimer = createTimer(`Worker Download Video`);
+    let blob;
+    try {
+        const fileRes = await quickFetch(variant.url, { headers: BROWSER_HEADERS }, CONFIG.DOWNLOAD_TIMEOUT);
+        if (!fileRes.ok) throw new Error(`HTTP ${fileRes.status}`);
+
+        blob = await fileRes.blob();
+        downloadTimer.end(`下载完成, 大小: ${(blob.size / 1024 / 1024).toFixed(2)} MB`);
+    } catch (err) {
+        downloadTimer.end(`下载失败: ${err.message}`);
+        await tg('sendMessage', {
+            chat_id: chatId,
+            text: buildCaption(tweet, { variant, isManual, autoSelected }),
+            parse_mode: 'HTML',
+            reply_markup: replyMarkup
+        });
+        totalTimer.end('Worker 中转下载失败，回退文本链接');
+        return;
+    }
+
+    // 3.2 上传
+    const uploadTimer = createTimer(`TG Multipart Upload`);
+    try {
+        const uploadJson = await tgMultipart('sendVideo', {
+            chat_id: chatId,
+            caption,
+            parse_mode: 'HTML',
+            show_caption_above_media: true,
+            reply_markup: replyMarkup,
+            supports_streaming: true,
+            width: variant.width,
+            height: variant.height,
+            disable_content_type_detection: true
+        }, 'video', blob, `${tweetId}.mp4`);
+
+        if (uploadJson.ok) {
+            uploadTimer.end('上传成功 🎉');
+            totalTimer.end(`总发送完成 (Worker 中转通道) | 峰值内存: ${getMemoryUsageMB()}`);
+            return;
+        }
+        uploadTimer.end(`上传被 TG 拒绝: ${uploadJson.description}`);
+    } catch (err) {
+        uploadTimer.end(`上传网络异常: ${err.message}`);
+    }
+
+    // 4. 兜底
+    await tg('sendMessage', {
+        chat_id: chatId,
+        text: buildCaption(tweet, { variant, isManual, autoSelected }),
+        parse_mode: 'HTML',
+        reply_markup: replyMarkup
+    });
+    totalTimer.end('中转上传失败，最终回退文本链接');
+}
+
+// ======================
+// Serverless 主入口
+// ======================
+export default async function handler(req, res) {
+    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+    const reqTimer = createTimer('Full Serverless Request Lifetime');
+
+    if (req.body.callback_query) {
+        const callback = req.body.callback_query;
+        const chatId = callback.message.chat.id;
+        const callbackData = callback.data;
+
+        tg('answerCallbackQuery', { callback_query_id: callback.id }, false).catch(() => {});
+
+        if (callbackData.startsWith('list_q:')) {
+            const tweetId = callbackData.split(':')[1];
+            const progressData = await tg('sendMessage', { chat_id: chatId, text: "🔍 正在加载画质列表..." });
+            const progressMsgId = progressData.result?.message_id;
+
+            if (!progressMsgId) {
+                reqTimer.end('Callback list_q: 进度条发送失败');
+                return res.status(200).send('OK');
+            }
+
+            try {
+                const cacheData = await getTweet(tweetId);
+                const { tweet, baseVariants } = cacheData;
+
+                if (!tweet || baseVariants.length === 0) {
+                    await tg('editMessageText', {
+                        chat_id: chatId,
+                        message_id: progressMsgId,
+                        text: "❌ 未能获取到有效的视频流资料。"
+                    });
+                    reqTimer.end('Callback list_q: 无视频流');
+                    return res.status(200).send('OK');
+                }
+
+                const displayVariants = uniqueQualityVariants(baseVariants).slice(0, 6);
+                await fillVariantsSize(displayVariants);
+
+                const finalVariants = prepareDisplayVariants(displayVariants);
+                const keyboard = finalVariants.map((v) => {
+                    const sizeText = v.size > 0 ? `${(v.size / (1024 * 1024)).toFixed(1)} MB` : '未知大小';
+                    const originalIndex = baseVariants.indexOf(v);
+                    return [{
+                        text: `${v.label} · ${sizeText}`,
+                        callback_data: `send_q:${tweetId}:${originalIndex}`
+                    }];
+                });
+
+                await tg('editMessageText', {
+                    chat_id: chatId,
+                    message_id: progressMsgId,
+                    text: `📊 <b>推文 [${tweetId}] 画质清单</b>`,
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: keyboard }
+                });
+
+            } catch (err) {
+                console.error(`[list_q] 加载异常:`, err.message);
+                try {
+                    await tg('editMessageText', {
+                        chat_id: chatId,
+                        message_id: progressMsgId,
+                        text: `❌ 加载发生异常: ${err.message}`
+                    });
+                } catch {}
+            }
+            reqTimer.end('Callback list_q 处理完成');
+            return res.status(200).send('OK');
+        }
+
+        if (callbackData.startsWith('send_q:')) {
+            const [, tweetId, indexStr] = callbackData.split(':');
+            const variantIndex = parseInt(indexStr, 10);
+
+            try {
+                const cacheData = await getTweet(tweetId);
+                const { tweet, baseVariants } = cacheData;
+                if (tweet && baseVariants[variantIndex]) {
+                    const chosenVariant = baseVariants[variantIndex];
+                    if (chosenVariant.size === 0) {
+                        chosenVariant.size = await getFileSize(chosenVariant.url);
+                    }
+                    await sendSpecificVideo(chatId, tweet, chosenVariant, { isManual: true });
+                }
+            } catch (e) {
+                console.error('[send_q] 手动投递失败', e.message);
+            }
+            reqTimer.end('Callback send_q 处理完成');
+            return res.status(200).send('OK');
+        }
+
+        reqTimer.end('Unknown Callback Query');
+        return res.status(200).send('OK');
+    }
+
+    const msg = req.body.message || req.body.channel_post;
+    if (!msg || !msg.text) {
+        reqTimer.end('非文本消息，略过');
+        return res.status(200).send('OK');
+    }
+
+    const text = msg.text.trim();
+    const chatId = msg.chat.id;
+    const messageId = msg.message_id;
+
+    tg('deleteMessage', { chat_id: chatId, message_id: messageId }, false).catch(() => {});
+
+    if (text === '/start') {
+        await tg('sendMessage', {
+            chat_id: chatId,
+            text: `<b>🤖 X/Twitter 视频解析机器人</b>\n📌 使用方式：直接发送 X / Twitter 推文链接，机器人会自动解析并发送视频 / 图片。\n✨ 功能特性：\n• 自动选择 ≤44MB 的最高画质发送\n• 支持手动切换不同清晰度\n• 自动识别图片与纯文本推文\n• 超 44MB 视频提供下载链接`,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+        });
+        reqTimer.end('/start 指令响应完成');
+        return res.status(200).send('OK');
+    }
+
+    const twitterRegex = /(?:x|twitter)\.com\/[a-zA-Z0-9_]+\/status\/(\d+)/i;
+    const match = text.match(twitterRegex);
+    if (!match) {
+        reqTimer.end('非 Twitter 链接，忽略');
+        return res.status(200).send('OK');
+    }
+
+    const tweetId = match[1];
+
+    try {
+        const cacheData = await getTweet(tweetId);
+        const { tweet, baseVariants } = cacheData;
+        const photos = tweet.media?.photos || [];
+
+        if (baseVariants.length > 0) {
+            const bestVariant = await findBestUnderLimit(baseVariants);
+
+            if (bestVariant) {
+                await sendSpecificVideo(chatId, tweet, bestVariant, { autoSelected: true });
+            } else {
+                const topVariant = baseVariants[0];
+                if (topVariant.size === 0) {
+                    topVariant.size = await getFileSize(topVariant.url);
+                }
+                await sendSpecificVideo(chatId, tweet, topVariant, { isManual: false });
+            }
+        } 
+        else if (photos.length > 0) {
+            const replyMarkup = { inline_keyboard: [[{ text: "📊 查看所有画质与体积", callback_data: `list_q:${tweetId}` }]] };
+            const caption = buildCaption(tweet);
+
+            if (photos.length === 1) {
+                await tg('sendPhoto', {
+                    chat_id: chatId,
+                    photo: photos[0].url,
+                    caption,
+                    parse_mode: 'HTML',
+                    show_caption_above_media: true,
+                    reply_markup: replyMarkup
+                });
+            } else {
+                const mediaGroup = photos.map((p, idx) => ({
+                    type: 'photo',
+                    media: p.url,
+                    caption: idx === 0 ? caption : '',
+                    parse_mode: idx === 0 ? 'HTML' : undefined,
+                    show_caption_above_media: idx === 0 ? true : undefined
+                }));
+                await tg('sendMediaGroup', { chat_id: chatId, media: mediaGroup });
+            }
+        } 
+        else {
+            await tg('sendMessage', {
+                chat_id: chatId,
+                text: buildCaption(tweet),
+                parse_mode: 'HTML'
+            });
+        }
+
+    } catch (error) {
+        console.error('[总线报错]:', error.message);
+    }
+
+    reqTimer.end(`推文 [${tweetId}] 处理总流程结束`);
     return res.status(200).send('OK');
-  }
 }
